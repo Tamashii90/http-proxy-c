@@ -17,6 +17,8 @@
 #include "libhttp.h"
 #include "wq.h"
 
+#define BUFFER 500
+
 /*
  * Global configuration variables.
  * You need to use these in your implementation of handle_files_request and
@@ -31,20 +33,35 @@ char* server_files_directory;
 char* server_proxy_hostname;
 int server_proxy_port;
 
-/*
- * Serves the contents the file stored at `path` to the client socket `fd`.
- * It is the caller's reponsibility to ensure that the file stored at `path`
- * exists.
- */
-void serve_file(int fd, char* path) {
-  /* TODO: PART 2 */
+/*  Serves the contents the file stored at `path` to the client socket `fd`. */
+void serve_file(int sock_fd, char* path) {
   /* PART 2 BEGIN */
+  char buffer[BUFFER];
+  int red;
+  int file_fd;
 
-  http_start_response(fd, 200);
-  http_send_header(fd, "Content-Type", http_get_mime_type(path));
-  http_send_header(fd, "Content-Length", "0");  // TODO: change this line too
-  http_end_headers(fd);
+  file_fd = open(path, O_RDONLY);
+  if (file_fd < 0) {
+    http_reject_response(sock_fd, 404);
+    perror("open error");
+    close(sock_fd);
+    return;
+  }
+  off_t file_size = lseek(file_fd, 0, SEEK_END);
 
+  http_start_response(sock_fd, 200);
+  http_send_header(sock_fd, "Content-Type", http_get_mime_type(path));
+  dprintf(sock_fd, "%s: %zu\r\n", "Content-Length", file_size);
+  http_end_headers(sock_fd);
+
+  // Return after checking file size
+  lseek(file_fd, 0, SEEK_SET);
+
+  while ((red = read(file_fd, buffer, BUFFER)) > 0) {
+    write(sock_fd, buffer, red);
+  }
+
+  close(file_fd);
   /* PART 2 END */
 }
 
@@ -115,6 +132,7 @@ void handle_files_request(int fd) {
    */
 
   /* PART 2 & 3 BEGIN */
+  serve_file(fd, path);
 
   /* PART 2 & 3 END */
 
