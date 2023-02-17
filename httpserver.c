@@ -66,22 +66,52 @@ void serve_file(int sock_fd, char* path) {
 }
 
 void serve_directory(int fd, char* path) {
+  DIR* dirp = opendir(path);
+  if (dirp == NULL) {
+    perror("opendir failed");
+    http_reject_response(fd, 500);
+    closedir(dirp);
+    return;
+  }
+
+  // Check if dir has an index.html
+  errno = 0;
+  struct dirent* dirent;
+  while ((dirent = readdir(dirp)) != NULL) {
+    if (strcmp(dirent->d_name, "index.html") == 0) {
+      int length = strlen(path) + strlen("/index.html") + 1;
+      char buffer[length];
+      http_format_index(buffer, path);
+      closedir(dirp);
+      serve_file(fd, buffer);
+      return;
+    }
+  }
+  if (errno) {
+    perror("readdir failed");
+    http_reject_response(fd, 500);
+    closedir(dirp);
+    return;
+  }
+
   http_start_response(fd, 200);
-  http_send_header(fd, "Content-Type", http_get_mime_type(".html"));
+  http_send_header(fd, "Content-Type", "text/html");
   http_end_headers(fd);
 
-  /* TODO: PART 3 */
-  /* PART 3 BEGIN */
-
-  // TODO: Open the directory (Hint: opendir() may be useful here)
-
-  /**
-   * TODO: For each entry in the directory (Hint: look at the usage of
-   * readdir() ), send a string containing a properly formatted HTML. (Hint:
-   * the http_format_href() function in libhttp.c may be useful here)
-   */
-
-  /* PART 3 END */
+  // No index.html. List entries.
+  rewinddir(dirp);
+  while ((dirent = readdir(dirp)) != NULL) {
+    // TODO: Add link to parent directory except if it's the top directory (www)
+    if (strcmp(dirent->d_name, "..") == 0 || strcmp(dirent->d_name, ".") == 0) {
+      continue;
+    }
+    int length = strlen("<a href=\"//\"></a><br/>") + strlen(path) +
+                 strlen(dirent->d_name) * 2 + 1;
+    char buffer[length];
+    http_format_href(buffer, path, dirent->d_name);
+    dprintf(fd, "%s", buffer);
+  }
+  closedir(dirp);
 }
 
 /*
@@ -132,7 +162,17 @@ void handle_files_request(int fd) {
    */
 
   /* PART 2 & 3 BEGIN */
-  serve_file(fd, path);
+  struct stat file_stat;
+  if (stat(path, &file_stat) == -1) {
+    http_reject_response(fd, 404);
+    close(fd);
+    return;
+  }
+
+  if (S_ISREG(file_stat.st_mode))
+    serve_file(fd, path);
+  else
+    serve_directory(fd, path);
 
   /* PART 2 & 3 END */
 
