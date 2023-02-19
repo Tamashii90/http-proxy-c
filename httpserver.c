@@ -93,25 +93,34 @@ void serve_directory(int fd, char* path) {
     closedir(dirp);
     return;
   }
+  closedir(dirp);
 
   http_start_response(fd, 200);
   http_send_header(fd, "Content-Type", "text/html");
   http_end_headers(fd);
 
   // No index.html. List entries.
-  rewinddir(dirp);
-  while ((dirent = readdir(dirp)) != NULL) {
-    // TODO: Add link to parent directory except if it's the top directory (www)
-    if (strcmp(dirent->d_name, "..") == 0 || strcmp(dirent->d_name, ".") == 0) {
+  struct dirent** namelist;
+  int files_num;
+  files_num = scandir(path, &namelist, NULL, alphasort);
+  if (files_num < 0) {
+    perror("scandir");
+    http_reject_response(fd, 500);
+    return;
+  }
+  for (int i = 0; i < files_num; i++) {
+    if (strcmp(namelist[i]->d_name, ".") == 0) {
       continue;
     }
+
     int length = strlen("<a href=\"//\"></a><br/>") + strlen(path) +
-                 strlen(dirent->d_name) * 2 + 1;
+                 strlen(namelist[i]->d_name) * 2 + 1;
     char buffer[length];
-    http_format_href(buffer, path, dirent->d_name);
+    http_format_href(buffer, path, namelist[i]->d_name);
     dprintf(fd, "%s", buffer);
+    free(namelist[i]);
   }
-  closedir(dirp);
+  free(namelist);
 }
 
 /*
@@ -146,36 +155,37 @@ void handle_files_request(int fd) {
     return;
   }
 
-  /* Remove beginning `./` */
+  /* Convert beginning '/' to './' */
   char* path = malloc(1 + strlen(request->path) + 1);
   path[0] = '.';
   memcpy(path + 1, request->path, strlen(request->path) + 1);
 
-  /*
-   * TODO: PART 2 is to serve files. If the file given by `path` exists,
-   * call serve_file() on it. Else, serve a 404 Not Found error below.
-   * The `stat()` syscall will be useful here.
-   *
-   * TODO: PART 3 is to serve both files and directories. You will need to
-   * determine when to call serve_file() or serve_directory() depending
-   * on `path`. Make your edits below here in this function.
-   */
-
-  /* PART 2 & 3 BEGIN */
+  // Check if path exists
   struct stat file_stat;
   if (stat(path, &file_stat) == -1) {
     http_reject_response(fd, 404);
+    free(path);
     close(fd);
     return;
   }
 
+  // Get rid of any extra slashes
+  // Must free() string returned by realpath
+  char* real_path = realpath(path, NULL);
+  char* relative_path = strstr(real_path, server_files_directory);
+
+  // Skip public folder's name
+  relative_path += strlen(server_files_directory);
+  // If not top level directory, skip slash.
+  relative_path = *relative_path != 0 ? relative_path + 1 : "./";
+
   if (S_ISREG(file_stat.st_mode))
-    serve_file(fd, path);
+    serve_file(fd, relative_path);
   else
-    serve_directory(fd, path);
+    serve_directory(fd, relative_path);
 
-  /* PART 2 & 3 END */
-
+  free(real_path);
+  free(path);
   close(fd);
   return;
 }
