@@ -20,15 +20,22 @@
 #ifndef LIBHTTP_H
 #define LIBHTTP_H
 
-/*
- * Functions for parsing an HTTP request.
- */
+#include <stddef.h>
+#include <sys/types.h>
+#define LIBHTTP_REQUEST_MAX_SIZE 8192
+
+enum body_enum { BODY_NONE, BODY_LENGTH, BODY_CHUNKED };
 struct http_request {
   char* method;
   char* path;
 };
 
+/*
+ * Functions for parsing an HTTP request/response.
+ */
 struct http_request* http_request_parse(int fd);
+ssize_t http_get_next_chunk(int socket_fd);
+ssize_t http_get_content_length(char* http_header);
 
 /*
  * Functions for sending an HTTP response.
@@ -44,5 +51,13 @@ void http_format_index(char* buffer, char* path);
  * Helper function: gets the Content-Type based on a file name.
  */
 char* http_get_mime_type(char* file_name);
+
+/* Reliable read & write */
+ssize_t writen(int fd, const void* buffer, size_t n);
+ssize_t readn(int fd, void* buffer, size_t n);
+
+/* Util functions */
+void str_to_lower(char* str, size_t len);
+enum body_enum has_body(char* http_header, size_t len);
 
 #endif

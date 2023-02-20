@@ -1,12 +1,124 @@
 #include "libhttp.h"
 
+#include <asm-generic/errno-base.h>
+#include <ctype.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
+#include <wchar.h>
+#include <wctype.h>
 
-#define LIBHTTP_REQUEST_MAX_SIZE 8192
+ssize_t writen(int fd, const void* buffer, size_t n) {
+  errno = 0;
+  ssize_t wrote;
+  size_t total;
+  const char* it;
+
+  it = buffer;
+  for (total = 0; total < n;) {
+    wrote = write(fd, it, n - total);
+    if (wrote == -1) {
+      if (errno == EINTR) {
+        continue;
+      } else {
+        return -1;
+      }
+    }
+    total += wrote;
+    it += wrote;
+  }
+  if (total != n) {
+    printf("WRITEN ERROR! total != n\n");
+  }
+  return total;
+}
+
+ssize_t readn(int fd, void* buffer, size_t n) {
+  errno = 0;
+  ssize_t red;
+  size_t total;
+  char* it;
+
+  it = buffer;
+  for (total = 0; total < n;) {
+    red = read(fd, it, n - total);
+    if (red == 0) {
+      break;
+    }
+    if (red == -1) {
+      if (errno == EINTR) {
+        continue;
+      } else {
+        return -1;
+      }
+    }
+    total += red;
+    it += red;
+  }
+  return total;
+}
+
+/* chunk_size is the chunk size value at the beginning of each  chunk plus
+ * "\r\n\r\n" plus the num of digits of the chunk size number */
+ssize_t http_get_next_chunk(int socket_fd) {
+  char recv_str[255];
+  ssize_t chunk_size = -1;
+  char* end_ptr = NULL;
+  size_t test = 0;
+  ssize_t red = 0;
+  for (size_t i = 1;; i++) {
+    if ((red = recv(socket_fd, recv_str, i, MSG_WAITALL | MSG_PEEK)) == -1) {
+      perror("Error get_next_chunk");
+      return -1;
+    }
+    recv_str[red] = '\0';
+    // printf(recv_str);
+    // test++;
+    // if (test == 20) {
+    // exit(-1);
+    // }
+    if (strchr(recv_str, '\r') != NULL) {
+      break;
+    }
+  }
+  chunk_size = strtol(recv_str, &end_ptr, 16);
+  chunk_size += 4 + end_ptr - recv_str;
+  return chunk_size;
+}
+
+ssize_t http_get_content_length(char* http_header) {
+  // No need to call str_to_lower because it's already
+  // been called in has_body
+  char* found = strstr(http_header, "content-length: ");
+  if (found == NULL) {
+    return -1;
+  }
+  found += strlen("content-length: ");
+  return strtol(found, NULL, 10);
+}
+
+enum body_enum has_body(char* http_header, size_t len) {
+  str_to_lower(http_header, len);
+  if (strstr(http_header, "content-length") != NULL) {
+    return BODY_LENGTH;
+  }
+  if (strstr(http_header, "transfer-encoding: chunked") != NULL) {
+    return BODY_CHUNKED;
+  }
+  return BODY_NONE;
+}
+
+void str_to_lower(char* str, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    str[i] = tolower(str[i]);
+  }
+}
 
 void http_fatal_error(char* message) {
   fprintf(stderr, "%s\n", message);
@@ -22,6 +134,7 @@ struct http_request* http_request_parse(int fd) {
 
   int bytes_read = read(fd, read_buffer, LIBHTTP_REQUEST_MAX_SIZE);
   read_buffer[bytes_read] = '\0'; /* Always null-terminate. */
+  printf("%s", read_buffer);
 
   char *read_start, *read_end;
   size_t read_size;

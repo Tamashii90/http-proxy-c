@@ -5,7 +5,9 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,11 +15,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <wchar.h>
 
 #include "libhttp.h"
 #include "wq.h"
 
-#define BUFFER 500
+#define BUFFER 2048
 
 /*
  * Global configuration variables.
@@ -32,10 +35,210 @@ int backlog;
 char* server_files_directory;
 char* server_proxy_hostname;
 int server_proxy_port;
+pthread_cond_t cond;
+pthread_mutex_t mutex;
+bool isDone = false;
+bool isMade = false;
+
+typedef struct {
+  int client_fd;
+  int* target_fd_adr;
+} ARGS;
+
+void* thread_func(void* args_) {
+  ARGS* args = (ARGS*)args_;
+  int client_fd = args->client_fd;
+  int* target_fd = args->target_fd_adr;
+  // Create an IPv4 TCP socket to communicate with the proxy target.
+  *target_fd = socket(PF_INET, SOCK_STREAM, 0);
+  if (*target_fd == -1) {
+    fprintf(stderr, "Failed to create a new socket: error %d: %s\n", errno,
+            strerror(errno));
+    close(client_fd);
+    exit(errno);
+  }
+
+  // So that reading more than the server sent doesn't cause
+  // the read() to block for long
+  struct timeval timeout = {.tv_sec = 0, .tv_usec = 900000};
+  if (setsockopt(*target_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                 sizeof(timeout)) < 0) {
+    perror("setsockopt failed");
+  }
+
+  /*
+   * The code below does a DNS lookup of server_proxy_hostname and
+   * opens a connection to it. Please do not modify.
+   */
+  struct sockaddr_in target_address;
+  memset(&target_address, 0, sizeof(target_address));
+  target_address.sin_family = AF_INET;
+  target_address.sin_port = htons(server_proxy_port);
+
+  // Use DNS to resolve the proxy target's IP address
+  struct hostent* target_dns_entry =
+      gethostbyname2(server_proxy_hostname, AF_INET);
+
+  if (target_dns_entry == NULL) {
+    fprintf(stderr, "Cannot find host: %s\n", server_proxy_hostname);
+    close(*target_fd);
+    close(client_fd);
+    exit(ENXIO);
+  }
+
+  char* dns_address = target_dns_entry->h_addr_list[0];
+
+  // Connect to the proxy target.
+  memcpy(&target_address.sin_addr, dns_address,
+         sizeof(target_address.sin_addr));
+  int connection_status = connect(*target_fd, (struct sockaddr*)&target_address,
+                                  sizeof(target_address));
+
+  if (connection_status < 0) {
+    /* Dummy request parsing, just to be compliant. */
+    struct http_request* req = http_request_parse(client_fd);
+
+    http_start_response(client_fd, 502);
+    http_send_header(client_fd, "Content-Type", "text/html");
+    http_end_headers(client_fd);
+    free(req);
+    close(*target_fd);
+    close(client_fd);
+    pthread_exit(NULL);
+  }
+  pthread_mutex_lock(&mutex);
+  isMade = true;
+  pthread_cond_signal(&cond);
+  pthread_mutex_unlock(&mutex);
+
+  char* buffer = malloc(sizeof(char) * (LIBHTTP_REQUEST_MAX_SIZE + 1));
+  char* post_header = NULL;
+  size_t header_len;
+  ssize_t red;
+  enum body_enum body;
+  size_t total = 0;
+  size_t overflow = 0;
+
+  // Read the HTTP header
+  while (total < LIBHTTP_REQUEST_MAX_SIZE) {
+    if ((red = read(*target_fd, buffer + total,
+                    LIBHTTP_REQUEST_MAX_SIZE - total)) <= 0) {
+      perror("header read failed");
+    }
+    total += red;
+    buffer[total] = '\0';
+    if ((post_header = strstr(buffer, "\r\n\r\n")) != NULL) {
+      // Calculate how many characters were read past the header
+      post_header += 4;
+      overflow = (size_t)&buffer[total] - (size_t)post_header;
+      printf("TOTAL RED = %zd\n", total);
+      printf("%s", buffer);
+      printf("ARIIIIII ========= %zd\n", overflow);
+      header_len = (size_t)post_header - (size_t)buffer;
+      printf("header_len ============== %zd\n", header_len);
+      // writen(STDOUT_FILENO, post_header - 10, 20);
+
+      // Send the HTTP header
+      if (writen(client_fd, buffer, header_len) == -1) {
+        perror("thread: header writen failed");
+      }
+
+      break;
+      // // Send characters past the header, if any
+      // if (writen(client_fd, post_header, overflow) == -1) {
+      // perror("thread: header writen failed");
+      // }
+      // break;
+    }
+  }
+
+  body = has_body(buffer, header_len);
+
+  size_t chunk_size;
+  if (body == BODY_CHUNKED && overflow > 0) {
+    char* end_ptr;
+    // chunk_size is the chunk size value at the beginning of each chunk
+    // plus "\r\n\r\n" plus the num of digits of the chunk size number
+    chunk_size = strtol(post_header, &end_ptr, 16);
+    chunk_size += 4 + end_ptr - post_header;
+    // writen(client_fd, post_header, chunk_size);
+    // exit(-1);
+  } else if (body == BODY_CHUNKED) {
+    chunk_size = http_get_next_chunk(*target_fd);
+  } else if (body == BODY_LENGTH) {
+    chunk_size = http_get_content_length(buffer);
+  }
+
+  if (body != BODY_NONE && overflow > 0) {
+    chunk_size -= overflow;
+  }
+
+  printf("CHUUUUNK ========= %zd\n", chunk_size);
+
+  // Copy overflown characters
+  memcpy(buffer, post_header, overflow);
+
+  if (body != BODY_NONE) {
+    while (chunk_size != 0) {
+      size_t read_size;
+      size_t total;
+
+      if (chunk_size < LIBHTTP_REQUEST_MAX_SIZE) {
+        read_size = chunk_size;
+      } else {
+        read_size = LIBHTTP_REQUEST_MAX_SIZE;
+      }
+      // total = overflow because of memcpy in header parsing above
+      for (total = overflow; total < chunk_size;) {
+        red = readn(*target_fd, buffer + overflow, read_size - overflow);
+        if (red < 0) {
+          perror("reading chunk error");
+          exit(-1);
+        }
+        buffer[red] = '\0';
+        total += red;
+        printf("red %zu\n", red);
+        if (writen(client_fd, buffer, red + overflow) == -1) {
+          perror("thread: body writen failed");
+          break;
+        }
+
+        overflow = 0;
+
+        if (chunk_size - total < LIBHTTP_REQUEST_MAX_SIZE) {
+          read_size = chunk_size - total;
+        } else {
+          read_size = LIBHTTP_REQUEST_MAX_SIZE;
+        }
+      }
+
+      if (body == BODY_LENGTH) {
+        printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total,
+               chunk_size);
+        break;
+      }
+
+      if (strstr(buffer, "0\r\n\r\n") != NULL) {
+        puts("BREEEEEEEEEEAK!");
+        break;
+      }
+      chunk_size = http_get_next_chunk(*target_fd);
+      printf("chunk_size = %zu\n", chunk_size);
+    }
+  }
+
+  close(*target_fd);
+  free(buffer);
+  pthread_mutex_lock(&mutex);
+  isDone = true;
+  puts("Sending finish signal");
+  pthread_cond_signal(&cond);
+  pthread_mutex_unlock(&mutex);
+  pthread_exit(NULL);
+}
 
 /*  Serves the contents the file stored at `path` to the client socket `fd`. */
 void serve_file(int sock_fd, char* path) {
-  /* PART 2 BEGIN */
   char buffer[BUFFER];
   int red;
   int file_fd;
@@ -54,15 +257,16 @@ void serve_file(int sock_fd, char* path) {
   dprintf(sock_fd, "%s: %zu\r\n", "Content-Length", file_size);
   http_end_headers(sock_fd);
 
-  // Return after checking file size
+  // Rewind after checking file size
   lseek(file_fd, 0, SEEK_SET);
 
   while ((red = read(file_fd, buffer, BUFFER)) > 0) {
-    write(sock_fd, buffer, red);
+    if (writen(sock_fd, buffer, red) == -1) {
+      perror("serve_file: Writen failed");
+    }
   }
 
   close(file_fd);
-  /* PART 2 END */
 }
 
 void serve_directory(int fd, char* path) {
@@ -138,19 +342,16 @@ void serve_directory(int fd, char* path) {
  */
 void handle_files_request(int fd) {
   struct http_request* request = http_request_parse(fd);
-
   if (request == NULL || request->path[0] != '/') {
-    http_start_response(fd, 400);
-    http_send_header(fd, "Content-Type", "text/html");
-    http_end_headers(fd);
+    http_reject_response(fd, 400);
+    free(request);
     close(fd);
     return;
   }
 
   if (strstr(request->path, "..") != NULL) {
-    http_start_response(fd, 403);
-    http_send_header(fd, "Content-Type", "text/html");
-    http_end_headers(fd);
+    http_reject_response(fd, 403);
+    free(request);
     close(fd);
     return;
   }
@@ -164,6 +365,7 @@ void handle_files_request(int fd) {
   struct stat file_stat;
   if (stat(path, &file_stat) == -1) {
     http_reject_response(fd, 404);
+    free(request);
     free(path);
     close(fd);
     return;
@@ -185,6 +387,7 @@ void handle_files_request(int fd) {
     serve_directory(fd, relative_path);
 
   free(real_path);
+  free(request);
   free(path);
   close(fd);
   return;
@@ -192,71 +395,72 @@ void handle_files_request(int fd) {
 
 /*
  * Opens a connection to the proxy target (hostname=server_proxy_hostname and
- * port=server_proxy_port) and relays traffic to/from the stream fd and the
- * proxy target_fd. HTTP requests from the client (fd) should be sent to the
- * proxy target (target_fd), and HTTP responses from the proxy target
- * (target_fd) should be sent to the client (fd).
+ * port=server_proxy_port) and relays traffic to/from the stream client_fd and
+ * the proxy target_fd. HTTP requests from the client (client_fd) should be sent
+ * to the proxy target (target_fd), and HTTP responses from the proxy target
+ * (target_fd) should be sent to the client (client_fd).
  *
  *   +--------+     +------------+     +--------------+
  *   | client | <-> | httpserver | <-> | proxy target |
  *   +--------+     +------------+     +--------------+
  *
- *   Closes client socket (fd) and proxy target fd (target_fd) when finished.
+ *   Closes client socket (client_fd) and proxy target client_fd (target_fd)
+ * when finished.
  */
-void handle_proxy_request(int fd) {
-  /*
-   * The code below does a DNS lookup of server_proxy_hostname and
-   * opens a connection to it. Please do not modify.
-   */
-  struct sockaddr_in target_address;
-  memset(&target_address, 0, sizeof(target_address));
-  target_address.sin_family = AF_INET;
-  target_address.sin_port = htons(server_proxy_port);
+void handle_proxy_request(int client_fd) {
+  // Create a second thread to RECEIVE data from target server
+  pthread_t receive_thread;
+  int target_fd = -99;
+  ARGS args = {.target_fd_adr = &target_fd, .client_fd = client_fd};
+  pthread_cond_init(&cond, NULL);
+  pthread_mutex_init(&mutex, NULL);
 
-  // Use DNS to resolve the proxy target's IP address
-  struct hostent* target_dns_entry =
-      gethostbyname2(server_proxy_hostname, AF_INET);
+  // Let main thread handle data SENDING to target server
+  char buffer[LIBHTTP_REQUEST_MAX_SIZE];
+  int req_size = 0;
+  while (1) {
+    req_size = read(client_fd, buffer, LIBHTTP_REQUEST_MAX_SIZE);
+    if (req_size <= 0) {
+      break;
+    }
+    pthread_create(&receive_thread, NULL, &thread_func, &args);
+    pthread_mutex_lock(&mutex);
+    while (!isMade) {
+      pthread_cond_wait(&cond, &mutex);
+    }
+    isMade = false;
+    pthread_mutex_unlock(&mutex);
+    // puts("RED client_fd");
+    // Replace Host header with the target server's hostname
+    char* post_host_header = buffer;
+    char* host_header = strstr(buffer, "Host:");
+    buffer[req_size] = '\0';
 
-  // Create an IPv4 TCP socket to communicate with the proxy target.
-  int target_fd = socket(PF_INET, SOCK_STREAM, 0);
-  if (target_fd == -1) {
-    fprintf(stderr, "Failed to create a new socket: error %d: %s\n", errno,
-            strerror(errno));
-    close(fd);
-    exit(errno);
+    if (host_header) {
+      // Plus 2 to skip \r\n
+      post_host_header = strstr(host_header, "\r\n") + 2;
+      if (writen(target_fd, buffer, (size_t)(host_header - buffer)) == -1) {
+        perror("send reqline: writen failed");
+      }
+      printf("%.*s", (int)(host_header - buffer), buffer);
+      http_send_header(target_fd, "Host", server_proxy_hostname);
+    }
+    if (writen(target_fd, post_host_header, strlen(post_host_header)) == -1) {
+      perror("writen failed");
+    }
+    pthread_mutex_lock(&mutex);
+    while (!isDone) {
+      pthread_cond_wait(&cond, &mutex);
+    }
+    isDone = false;
+    pthread_mutex_unlock(&mutex);
+    char* check = buffer + req_size - 4;
+    if (strncmp(check, "\r\n\r\n", 4) == 0) {
+      break;
+    }
   }
-
-  if (target_dns_entry == NULL) {
-    fprintf(stderr, "Cannot find host: %s\n", server_proxy_hostname);
-    close(target_fd);
-    close(fd);
-    exit(ENXIO);
-  }
-
-  char* dns_address = target_dns_entry->h_addr_list[0];
-
-  // Connect to the proxy target.
-  memcpy(&target_address.sin_addr, dns_address,
-         sizeof(target_address.sin_addr));
-  int connection_status = connect(target_fd, (struct sockaddr*)&target_address,
-                                  sizeof(target_address));
-
-  if (connection_status < 0) {
-    /* Dummy request parsing, just to be compliant. */
-    http_request_parse(fd);
-
-    http_start_response(fd, 502);
-    http_send_header(fd, "Content-Type", "text/html");
-    http_end_headers(fd);
-    close(target_fd);
-    close(fd);
-    return;
-  }
-
-  /* TODO: PART 4 */
-  /* PART 4 BEGIN */
-
-  /* PART 4 END */
+  close(client_fd);
+  puts("CLOOOOOOOOOOOOOOOOSING");
 }
 
 #ifdef POOLSERVER
