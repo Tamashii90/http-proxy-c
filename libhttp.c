@@ -1,5 +1,6 @@
 #include "libhttp.h"
 
+#include <arpa/inet.h>
 #include <asm-generic/errno-base.h>
 #include <ctype.h>
 #include <errno.h>
@@ -18,13 +19,12 @@ ssize_t writen(int fd, const void* buffer, size_t n) {
   errno = 0;
   ssize_t wrote;
   size_t total;
-  const char* it;
+  const unsigned char* it;
 
   it = buffer;
   for (total = 0; total < n;) {
-    wrote = write(fd, it, n - total);
-    if (wrote == -1) {
-      if (errno == EINTR) {
+    if ((wrote = write(fd, it, n - total)) <= 0) {
+      if (wrote == -1 && errno == EINTR) {
         continue;
       } else {
         return -1;
@@ -43,7 +43,7 @@ ssize_t readn(int fd, void* buffer, size_t n) {
   errno = 0;
   ssize_t red;
   size_t total;
-  char* it;
+  unsigned char* it;
 
   it = buffer;
   for (total = 0; total < n;) {
@@ -64,26 +64,92 @@ ssize_t readn(int fd, void* buffer, size_t n) {
   return total;
 }
 
+// Used for large Content-Length type messages
+int relay_large_msg(int from, int to, size_t size) {
+  size_t max_size = 5000;
+  char buffer[max_size];
+  size_t total;
+  ssize_t red;
+  size_t read_size;
+
+  if (size < max_size) {
+    read_size = size;
+  } else {
+    read_size = max_size;
+  }
+
+  for (total = 0; total < size;) {
+    red = readn(from, buffer, read_size);
+    if (red <= 0) {
+      return -1;
+    }
+    buffer[red] = '\0';
+    total += red;
+    size_t wrote;
+    if ((wrote = writen(to, buffer, red)) <= 0) {
+      printf("read %zu, wrote %zu\n", red, wrote);
+      return -1;
+    }
+    printf("read %zu, wrote %zu\n", red, wrote);
+
+    if (size - total < max_size) {
+      read_size = size - total;
+    } else {
+      read_size = max_size;
+    }
+  }
+  printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total, size);
+  return 1;
+}
+
+// int stream_find(char* buffer, size_t size, char* target, int socket_fd) {
+// char backup[LIBHTTP_REQUEST_MAX_SIZE];
+// char* found;
+// size_t end_len = strlen(target);
+//
+// if ((found = memchr(buffer, target[0], LIBHTTP_REQUEST_MAX_SIZE)) != NULL) {
+// printf("Found something!\n");
+// printf("{{{{{%s}}}}}\n", found);
+// size_t found_len1 = strlen(found);
+// size_t found_len2 = (size_t)&buffer[size] - (size_t)found;
+// size_t found_len = found_len2;
+// // printf("STRLEN ======= %zu\n", found_len1);
+// printf("ARILEN ======= %zu\n", found_len2);
+// if (found_len == end_len && memcmp(found, target, end_len) == 0) {
+// puts("TADA! found_len == end_len");
+// return true;
+// }
+// if (found_len < end_len) {
+// if (recv(socket_fd, backup, LIBHTTP_REQUEST_MAX_SIZE, MSG_PEEK) <= 0) {
+// perror("end sequence error");
+// return -1;
+// }
+// printf("backup has:\n");
+// printf("[[[[%s]]]]\n", backup);
+// if (memcmp(backup, target + found_len, end_len - found_len) == 0) {
+// puts("TADA! found_len < end_len");
+// return true;
+// }
+// }
+// }
+// return false;
+// }
+
 /* chunk_size is the chunk size value at the beginning of each  chunk plus
  * "\r\n\r\n" plus the num of digits of the chunk size number */
 ssize_t http_get_next_chunk(int socket_fd) {
   char recv_str[255];
-  ssize_t chunk_size = -1;
+  ssize_t chunk_size;
   char* end_ptr = NULL;
-  size_t test = 0;
   ssize_t red = 0;
   for (size_t i = 1;; i++) {
-    if ((red = recv(socket_fd, recv_str, i, MSG_WAITALL | MSG_PEEK)) == -1) {
+    if ((red = recv(socket_fd, recv_str, i, MSG_PEEK)) == -1) {
       perror("Error get_next_chunk");
       return -1;
     }
-    recv_str[red] = '\0';
-    // printf(recv_str);
-    // test++;
-    // if (test == 20) {
-    // exit(-1);
-    // }
-    if (strchr(recv_str, '\r') != NULL) {
+    if (memchr(recv_str, '\r', i) != NULL) {
+      // for printf debugging
+      // printf("In get_next_chunk:\n[[[%s]]]\n", recv_str);
       break;
     }
   }

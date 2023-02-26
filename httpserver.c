@@ -60,11 +60,11 @@ void* thread_func(void* args_) {
 
   // So that reading more than the server sent doesn't cause
   // the read() to block for long
-  struct timeval timeout = {.tv_sec = 0, .tv_usec = 900000};
-  if (setsockopt(*target_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                 sizeof(timeout)) < 0) {
-    perror("setsockopt failed");
-  }
+  // struct timeval timeout = {.tv_sec = 3, .tv_usec = 000000};
+  // if (setsockopt(*target_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+  // sizeof(timeout)) < 0) {
+  // perror("setsockopt failed");
+  // }
 
   /*
    * The code below does a DNS lookup of server_proxy_hostname and
@@ -111,7 +111,7 @@ void* thread_func(void* args_) {
   pthread_cond_signal(&cond);
   pthread_mutex_unlock(&mutex);
 
-  char* buffer = malloc(sizeof(char) * (LIBHTTP_REQUEST_MAX_SIZE + 1));
+  char* buffer = malloc(LIBHTTP_REQUEST_MAX_SIZE + 1);
   char* post_header = NULL;
   size_t header_len;
   ssize_t red;
@@ -121,9 +121,13 @@ void* thread_func(void* args_) {
 
   // Read the HTTP header
   while (total < LIBHTTP_REQUEST_MAX_SIZE) {
+    // Keep reading until "\r\n\r\n" is found
     if ((red = read(*target_fd, buffer + total,
                     LIBHTTP_REQUEST_MAX_SIZE - total)) <= 0) {
+      writen(STDOUT_FILENO, buffer, red);
       perror("header read failed");
+      exit(-1);
+      goto done;
     }
     total += red;
     buffer[total] = '\0';
@@ -133,100 +137,93 @@ void* thread_func(void* args_) {
       overflow = (size_t)&buffer[total] - (size_t)post_header;
       printf("TOTAL RED = %zd\n", total);
       printf("%s", buffer);
-      printf("ARIIIIII ========= %zd\n", overflow);
+      printf("OVEEERFLOWW   ========= %zu\n", overflow);
       header_len = (size_t)post_header - (size_t)buffer;
-      printf("header_len ============== %zd\n", header_len);
-      // writen(STDOUT_FILENO, post_header - 10, 20);
+      printf("HEADER LENGTH ============== %zd\n", header_len);
 
       // Send the HTTP header
-      if (writen(client_fd, buffer, header_len) == -1) {
+      if (writen(client_fd, buffer, total) == -1) {
         perror("thread: header writen failed");
+        goto done;
       }
 
       break;
-      // // Send characters past the header, if any
-      // if (writen(client_fd, post_header, overflow) == -1) {
-      // perror("thread: header writen failed");
-      // }
-      // break;
     }
   }
 
   body = has_body(buffer, header_len);
 
-  size_t chunk_size;
+  ssize_t chunk_size;
+
+  /* Overflow might be bigger than one chunk
+     Keep looking for last chunk size value read */
   if (body == BODY_CHUNKED && overflow > 0) {
     char* end_ptr;
-    // chunk_size is the chunk size value at the beginning of each chunk
-    // plus "\r\n\r\n" plus the num of digits of the chunk size number
-    chunk_size = strtol(post_header, &end_ptr, 16);
-    chunk_size += 4 + end_ptr - post_header;
-    // writen(client_fd, post_header, chunk_size);
-    // exit(-1);
-  } else if (body == BODY_CHUNKED) {
-    chunk_size = http_get_next_chunk(*target_fd);
-  } else if (body == BODY_LENGTH) {
-    chunk_size = http_get_content_length(buffer);
-  }
-
-  if (body != BODY_NONE && overflow > 0) {
+    char* position = post_header;
+    for (size_t size = 0; size < overflow; size += chunk_size) {
+      chunk_size = strtol(position, &end_ptr, 16);
+      chunk_size += 4 + end_ptr - position;
+      position += chunk_size;
+    }
+    if (chunk_size == 5 && strcmp(position - 5, "0\r\n\r\n") == 0) {
+      goto done;
+    }
     chunk_size -= overflow;
-  }
-
-  printf("CHUUUUNK ========= %zd\n", chunk_size);
-
-  // Copy overflown characters
-  memcpy(buffer, post_header, overflow);
-
-  if (body != BODY_NONE) {
-    while (chunk_size != 0) {
-      size_t read_size;
-      size_t total;
-
-      if (chunk_size < LIBHTTP_REQUEST_MAX_SIZE) {
-        read_size = chunk_size;
-      } else {
-        read_size = LIBHTTP_REQUEST_MAX_SIZE;
-      }
-      // total = overflow because of memcpy in header parsing above
-      for (total = overflow; total < chunk_size;) {
-        red = readn(*target_fd, buffer + overflow, read_size - overflow);
-        if (red < 0) {
-          perror("reading chunk error");
-          exit(-1);
-        }
-        buffer[red] = '\0';
-        total += red;
-        printf("red %zu\n", red);
-        if (writen(client_fd, buffer, red + overflow) == -1) {
-          perror("thread: body writen failed");
-          break;
-        }
-
-        overflow = 0;
-
-        if (chunk_size - total < LIBHTTP_REQUEST_MAX_SIZE) {
-          read_size = chunk_size - total;
-        } else {
-          read_size = LIBHTTP_REQUEST_MAX_SIZE;
-        }
-      }
-
-      if (body == BODY_LENGTH) {
-        printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total,
-               chunk_size);
-        break;
-      }
-
-      if (strstr(buffer, "0\r\n\r\n") != NULL) {
-        puts("BREEEEEEEEEEAK!");
-        break;
-      }
-      chunk_size = http_get_next_chunk(*target_fd);
-      printf("chunk_size = %zu\n", chunk_size);
+  } else if (body == BODY_CHUNKED) {
+    if ((chunk_size = http_get_next_chunk(*target_fd)) == -1) {
+      goto done;
     }
   }
 
+  if (body == BODY_LENGTH) {
+    chunk_size = http_get_content_length(buffer);
+    chunk_size -= overflow;
+    printf("CHUUUUNK ========= %zd\n", chunk_size);
+    if (relay_large_msg(*target_fd, client_fd, chunk_size) <= 0) {
+      perror("Error relay_large_msg");
+      exit(-1);
+      goto done;
+    }
+  }
+
+  while (body == BODY_CHUNKED) {
+    size_t read_size;
+    if (chunk_size < LIBHTTP_REQUEST_MAX_SIZE) {
+      read_size = chunk_size;
+    } else {
+      read_size = LIBHTTP_REQUEST_MAX_SIZE;
+    }
+
+    for (ssize_t total = 0; total < chunk_size;) {
+      if ((red = readn(*target_fd, buffer, read_size)) <= 0) {
+        perror("reading chunk error");
+        goto done;
+      }
+      buffer[red] = '\0';
+      total += red;
+      printf("red %zu\n", red);
+      if (writen(client_fd, buffer, red) == -1) {
+        perror("thread: body writen failed");
+        goto done;
+      }
+
+      if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
+        puts("SAAAAAAAYONAAAAAAAARAAAAAAAAAAA");
+        goto done;
+      }
+
+      if (chunk_size - total < LIBHTTP_REQUEST_MAX_SIZE) {
+        read_size = chunk_size - total;
+      } else {
+        read_size = LIBHTTP_REQUEST_MAX_SIZE;
+      }
+    }
+
+    chunk_size = http_get_next_chunk(*target_fd);
+    printf("NEXT CHUNK IS (%zu)\n", chunk_size);
+  }
+
+done:
   close(*target_fd);
   free(buffer);
   pthread_mutex_lock(&mutex);
@@ -455,6 +452,7 @@ void handle_proxy_request(int client_fd) {
     isDone = false;
     pthread_mutex_unlock(&mutex);
     char* check = buffer + req_size - 4;
+    // TODO: Change this because what if message has body (POST method)
     if (strncmp(check, "\r\n\r\n", 4) == 0) {
       break;
     }
