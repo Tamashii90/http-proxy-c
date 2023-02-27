@@ -135,7 +135,7 @@ void* thread_func(void* args_) {
       post_header += 4;
       overflow = &buffer[total] - post_header;
       printf("TOTAL RED = %zd\n", total);
-      printf("%s", buffer);
+      // printf("%s", buffer);
       printf("OVEEERFLOWW   ========= %zu\n", overflow);
       header_len = post_header - buffer;
       printf("HEADER LENGTH ============== %zd\n", header_len);
@@ -199,7 +199,7 @@ void* thread_func(void* args_) {
       }
       buffer[red] = '\0';
       total += red;
-      printf("red %zu\n", red);
+      // printf("red %zu\n", red);
       if (writen(client_fd, buffer, red) == -1) {
         perror("thread: body writen failed");
         goto done;
@@ -455,7 +455,7 @@ void handle_proxy_request(int client_fd) {
     }
   }
   close(client_fd);
-  puts("CLOOOOOOOOOOOOOOOOSING");
+  printf("CLOOOOOOOOOOOOOOOOSING %d\n", client_fd);
 }
 
 #ifdef POOLSERVER
@@ -519,15 +519,11 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
   server_address.sin_port = htons(server_port);
 
   /*
-   * TODO: PART 1
-   *
    * Given the socket created above, call bind() to give it
    * an address and a port. Then, call listen() with the socket.
    * An appropriate size of the backlog is 1024, though you may
    * play around with this value during performance testing.
    */
-
-  /* PART 1 BEGIN */
 
   if (bind(*socket_number, (struct sockaddr*)&server_address,
            sizeof(server_address)) == -1) {
@@ -540,7 +536,6 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
     exit(errno);
   }
 
-  /* PART 1 END */
   printf("Listening on port %d...\n", server_port);
 
 #ifdef POOLSERVER
@@ -560,8 +555,9 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
       continue;
     }
 
-    printf("Accepted connection from %s on port %d\n",
-           inet_ntoa(client_address.sin_addr), client_address.sin_port);
+    printf("Accepted connection from %s on port %d. SOCKEEEEEEEEET = %d\n",
+           inet_ntoa(client_address.sin_addr), client_address.sin_port,
+           client_socket_number);
 
 #ifdef BASICSERVER
     /*
@@ -576,8 +572,6 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
 
 #elif FORKSERVER
     /*
-     * TODO: PART 5
-     *
      * When a client connection has been accepted, a new
      * process is spawned. This child process will send
      * a response to the client. Afterwards, the child
@@ -585,10 +579,16 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
      * process should continue listening and accepting
      * connections.
      */
+    pid_t child_pid;
+    if ((child_pid = fork()) == -1) {
+      perror("Erorr forking");
+      exit(-1);
+    }
 
-    /* PART 5 BEGIN */
-
-    /* PART 5 END */
+    if (child_pid == 0) {
+      request_handler(client_socket_number);
+      exit(0);
+    }
 
 #elif THREADSERVER
     /*
