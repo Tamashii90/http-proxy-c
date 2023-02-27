@@ -126,7 +126,6 @@ void* thread_func(void* args_) {
                     LIBHTTP_REQUEST_MAX_SIZE - total)) <= 0) {
       writen(STDOUT_FILENO, buffer, red);
       perror("header read failed");
-      exit(-1);
       goto done;
     }
     total += red;
@@ -134,11 +133,11 @@ void* thread_func(void* args_) {
     if ((post_header = strstr(buffer, "\r\n\r\n")) != NULL) {
       // Calculate how many characters were read past the header
       post_header += 4;
-      overflow = (size_t)&buffer[total] - (size_t)post_header;
+      overflow = &buffer[total] - post_header;
       printf("TOTAL RED = %zd\n", total);
       printf("%s", buffer);
       printf("OVEEERFLOWW   ========= %zu\n", overflow);
-      header_len = (size_t)post_header - (size_t)buffer;
+      header_len = post_header - buffer;
       printf("HEADER LENGTH ============== %zd\n", header_len);
 
       // Send the HTTP header
@@ -181,7 +180,6 @@ void* thread_func(void* args_) {
     printf("CHUUUUNK ========= %zd\n", chunk_size);
     if (relay_large_msg(*target_fd, client_fd, chunk_size) <= 0) {
       perror("Error relay_large_msg");
-      exit(-1);
       goto done;
     }
   }
@@ -208,7 +206,6 @@ void* thread_func(void* args_) {
       }
 
       if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
-        puts("SAAAAAAAYONAAAAAAAARAAAAAAAAAAA");
         goto done;
       }
 
@@ -220,7 +217,6 @@ void* thread_func(void* args_) {
     }
 
     chunk_size = http_get_next_chunk(*target_fd);
-    printf("NEXT CHUNK IS (%zu)\n", chunk_size);
   }
 
 done:
@@ -414,10 +410,11 @@ void handle_proxy_request(int client_fd) {
 
   // Let main thread handle data SENDING to target server
   char buffer[LIBHTTP_REQUEST_MAX_SIZE];
-  int req_size = 0;
+  ssize_t red = 0;
   while (1) {
-    req_size = read(client_fd, buffer, LIBHTTP_REQUEST_MAX_SIZE);
-    if (req_size <= 0) {
+    red = read(client_fd, buffer, LIBHTTP_REQUEST_MAX_SIZE);
+    if (red <= 0) {
+      perror("Error reading request from client");
       break;
     }
     pthread_create(&receive_thread, NULL, &thread_func, &args);
@@ -427,22 +424,22 @@ void handle_proxy_request(int client_fd) {
     }
     isMade = false;
     pthread_mutex_unlock(&mutex);
-    // puts("RED client_fd");
-    // Replace Host header with the target server's hostname
-    char* post_host_header = buffer;
-    char* host_header = strstr(buffer, "Host:");
-    buffer[req_size] = '\0';
 
-    if (host_header) {
+    // Replace Host header with the target server's hostname
+    char* host_field = strstr(buffer, "Host:");
+    char* post_host_field = buffer;
+    buffer[red] = '\0';
+
+    if (host_field) {
       // Plus 2 to skip \r\n
-      post_host_header = strstr(host_header, "\r\n") + 2;
-      if (writen(target_fd, buffer, (size_t)(host_header - buffer)) == -1) {
+      post_host_field = strstr(host_field, "\r\n") + 2;
+      if (writen(target_fd, buffer, host_field - buffer) == -1) {
         perror("send reqline: writen failed");
       }
-      printf("%.*s", (int)(host_header - buffer), buffer);
+      printf("%.*s", (int)(host_field - buffer), buffer);
       http_send_header(target_fd, "Host", server_proxy_hostname);
     }
-    if (writen(target_fd, post_host_header, strlen(post_host_header)) == -1) {
+    if (writen(target_fd, post_host_field, strlen(post_host_field)) == -1) {
       perror("writen failed");
     }
     pthread_mutex_lock(&mutex);
@@ -451,7 +448,7 @@ void handle_proxy_request(int client_fd) {
     }
     isDone = false;
     pthread_mutex_unlock(&mutex);
-    char* check = buffer + req_size - 4;
+    char* check = buffer + red - 4;
     // TODO: Change this because what if message has body (POST method)
     if (strncmp(check, "\r\n\r\n", 4) == 0) {
       break;

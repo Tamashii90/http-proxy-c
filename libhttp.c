@@ -102,39 +102,6 @@ int relay_large_msg(int from, int to, size_t size) {
   return 1;
 }
 
-// int stream_find(char* buffer, size_t size, char* target, int socket_fd) {
-// char backup[LIBHTTP_REQUEST_MAX_SIZE];
-// char* found;
-// size_t end_len = strlen(target);
-//
-// if ((found = memchr(buffer, target[0], LIBHTTP_REQUEST_MAX_SIZE)) != NULL) {
-// printf("Found something!\n");
-// printf("{{{{{%s}}}}}\n", found);
-// size_t found_len1 = strlen(found);
-// size_t found_len2 = (size_t)&buffer[size] - (size_t)found;
-// size_t found_len = found_len2;
-// // printf("STRLEN ======= %zu\n", found_len1);
-// printf("ARILEN ======= %zu\n", found_len2);
-// if (found_len == end_len && memcmp(found, target, end_len) == 0) {
-// puts("TADA! found_len == end_len");
-// return true;
-// }
-// if (found_len < end_len) {
-// if (recv(socket_fd, backup, LIBHTTP_REQUEST_MAX_SIZE, MSG_PEEK) <= 0) {
-// perror("end sequence error");
-// return -1;
-// }
-// printf("backup has:\n");
-// printf("[[[[%s]]]]\n", backup);
-// if (memcmp(backup, target + found_len, end_len - found_len) == 0) {
-// puts("TADA! found_len < end_len");
-// return true;
-// }
-// }
-// }
-// return false;
-// }
-
 /* chunk_size is the chunk size value at the beginning of each  chunk plus
  * "\r\n\r\n" plus the num of digits of the chunk size number */
 ssize_t http_get_next_chunk(int socket_fd) {
@@ -147,9 +114,8 @@ ssize_t http_get_next_chunk(int socket_fd) {
       perror("Error get_next_chunk");
       return -1;
     }
+    // Do NOT use strchr because encoding might be raw bytes (gzip)
     if (memchr(recv_str, '\r', i) != NULL) {
-      // for printf debugging
-      // printf("In get_next_chunk:\n[[[%s]]]\n", recv_str);
       break;
     }
   }
