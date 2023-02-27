@@ -178,44 +178,23 @@ void* thread_func(void* args_) {
     chunk_size = http_get_content_length(buffer);
     chunk_size -= overflow;
     printf("CHUUUUNK ========= %zd\n", chunk_size);
-    if (relay_large_msg(*target_fd, client_fd, chunk_size) <= 0) {
-      perror("Error relay_large_msg");
+    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, *target_fd, client_fd,
+                        chunk_size) <= 0) {
+      perror("Error sending Content-Length message");
       goto done;
     }
   }
 
   while (body == BODY_CHUNKED) {
-    size_t read_size;
-    if (chunk_size < LIBHTTP_REQUEST_MAX_SIZE) {
-      read_size = chunk_size;
-    } else {
-      read_size = LIBHTTP_REQUEST_MAX_SIZE;
+    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, *target_fd, client_fd,
+                        chunk_size) <= 0) {
+      perror("Error sending chunk");
+      goto done;
     }
-
-    for (ssize_t total = 0; total < chunk_size;) {
-      if ((red = readn(*target_fd, buffer, read_size)) <= 0) {
-        perror("reading chunk error");
-        goto done;
-      }
-      buffer[red] = '\0';
-      total += red;
-      // printf("red %zu\n", red);
-      if (writen(client_fd, buffer, red) == -1) {
-        perror("thread: body writen failed");
-        goto done;
-      }
-
-      if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
-        goto done;
-      }
-
-      if (chunk_size - total < LIBHTTP_REQUEST_MAX_SIZE) {
-        read_size = chunk_size - total;
-      } else {
-        read_size = LIBHTTP_REQUEST_MAX_SIZE;
-      }
+    // Don't get more chunks if we sent the last one.
+    if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
+      goto done;
     }
-
     chunk_size = http_get_next_chunk(*target_fd);
   }
 

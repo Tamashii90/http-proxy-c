@@ -46,7 +46,8 @@ void http_send_header(int fd, char* key, char* value);
 void http_end_headers(int fd);
 void http_format_href(char* buffer, char* path, char* filename);
 void http_format_index(char* buffer, char* path);
-int relay_large_msg(int sock_from, int sock_to, size_t size);
+int relay_large_msg(char* buffer, size_t max_size, int sock_from, int sock_to,
+                    size_t msg_size);
 
 /*
  * Helper function: gets the Content-Type based on a file name.

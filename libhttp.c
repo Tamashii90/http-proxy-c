@@ -64,21 +64,20 @@ ssize_t readn(int fd, void* buffer, size_t n) {
   return total;
 }
 
-// Used for large Content-Length type messages
-int relay_large_msg(int from, int to, size_t size) {
-  size_t max_size = 5000;
-  char buffer[max_size];
+// Used in proxy mode to send large known-size messages
+int relay_large_msg(char* buffer, size_t max_size, int from, int to,
+                    size_t msg_size) {
   size_t total;
   ssize_t red;
   size_t read_size;
 
-  if (size < max_size) {
-    read_size = size;
+  if (msg_size < max_size) {
+    read_size = msg_size;
   } else {
     read_size = max_size;
   }
 
-  for (total = 0; total < size;) {
+  for (total = 0; total < msg_size;) {
     red = readn(from, buffer, read_size);
     if (red <= 0) {
       return -1;
@@ -90,16 +89,16 @@ int relay_large_msg(int from, int to, size_t size) {
       printf("read %zu, wrote %zu\n", red, wrote);
       return -1;
     }
-    printf("read %zu, wrote %zu\n", red, wrote);
+    // printf("read %zu, wrote %zu\n", red, wrote);
 
-    if (size - total < max_size) {
-      read_size = size - total;
+    if (msg_size - total < max_size) {
+      read_size = msg_size - total;
     } else {
       read_size = max_size;
     }
   }
-  printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total, size);
-  return 1;
+  printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total, msg_size);
+  return total == msg_size;
 }
 
 /* chunk_size is the chunk size value at the beginning of each  chunk plus
