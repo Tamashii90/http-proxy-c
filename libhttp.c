@@ -19,7 +19,7 @@ ssize_t writen(int fd, const void* buffer, size_t n) {
   errno = 0;
   ssize_t wrote;
   size_t total;
-  const unsigned char* it;
+  const char* it;
 
   it = buffer;
   for (total = 0; total < n;) {
@@ -43,7 +43,7 @@ ssize_t readn(int fd, void* buffer, size_t n) {
   errno = 0;
   ssize_t red;
   size_t total;
-  unsigned char* it;
+  char* it;
 
   it = buffer;
   for (total = 0; total < n;) {
@@ -99,6 +99,33 @@ int relay_large_msg(char* buffer, size_t max_size, int from, int to,
   }
   printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total, msg_size);
   return total == msg_size;
+}
+
+ssize_t get_header_len(int fd, char* target) {
+  char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
+  ssize_t red;
+  char* found;
+  ssize_t header_len;
+
+  for (size_t total = 0; total < LIBHTTP_REQUEST_MAX_SIZE;) {
+    // Get header length. Don't forget MSG_PEEK flag.
+    if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE, MSG_PEEK)) <= 0) {
+      if (red == 0) return 0;
+      perror("Error get_header_len recv");
+      return -1;
+    }
+    total += red;
+    buffer[total] = '\0';
+
+    // Found delimiter. Send the header.
+    if ((found = strstr(buffer, target)) != NULL) {
+      found += strlen(target);
+      header_len = found - buffer;
+      return header_len;
+    }
+  }
+  // Mustn't reach here if the request is well-formed.
+  return -1;
 }
 
 /* chunk_size is the chunk size value at the beginning of each  chunk plus

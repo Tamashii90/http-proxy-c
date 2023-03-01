@@ -48,10 +48,9 @@ void http_format_href(char* buffer, char* path, char* filename);
 void http_format_index(char* buffer, char* path);
 int relay_large_msg(char* buffer, size_t max_size, int sock_from, int sock_to,
                     size_t msg_size);
+ssize_t get_header_len(int socket_fd, char* target);
 
-/*
- * Helper function: gets the Content-Type based on a file name.
- */
+/* Gets the Content-Type based on a file name */
 char* http_get_mime_type(char* file_name);
 
 /* Reliable read & write */
@@ -61,6 +60,5 @@ ssize_t readn(int fd, void* buffer, size_t n);
 /* Util functions */
 void str_to_lower(char* str, size_t len);
 enum body_enum has_body(char* http_header, size_t len);
-int stream_find(char* buffer, size_t size, char* target, int sock_fd);
 
 #endif

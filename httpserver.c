@@ -107,76 +107,57 @@ void* thread_func(void* args_) {
     pthread_exit(NULL);
   }
   pthread_mutex_lock(&mutex);
-  isMade = true;
+  // isMade = true;
   pthread_cond_signal(&cond);
   pthread_mutex_unlock(&mutex);
 
   char* buffer = malloc(LIBHTTP_REQUEST_MAX_SIZE + 1);
-  char* post_header = NULL;
-  size_t header_len;
+  ssize_t header_len;
   ssize_t red;
   enum body_enum body;
-  size_t total = 0;
-  size_t overflow = 0;
 
   // Read the HTTP header
-  while (total < LIBHTTP_REQUEST_MAX_SIZE) {
-    // Keep reading until "\r\n\r\n" is found
-    if ((red = read(*target_fd, buffer + total,
-                    LIBHTTP_REQUEST_MAX_SIZE - total)) <= 0) {
-      writen(STDOUT_FILENO, buffer, red);
-      perror("header read failed");
-      goto done;
-    }
-    total += red;
-    buffer[total] = '\0';
-    if ((post_header = strstr(buffer, "\r\n\r\n")) != NULL) {
-      // Calculate how many characters were read past the header
-      post_header += 4;
-      overflow = &buffer[total] - post_header;
-      printf("TOTAL RED = %zd\n", total);
-      // printf("%s", buffer);
-      printf("OVEEERFLOWW   ========= %zu\n", overflow);
-      header_len = post_header - buffer;
-      printf("HEADER LENGTH ============== %zd\n", header_len);
-
-      // Send the HTTP header
-      if (writen(client_fd, buffer, total) == -1) {
-        perror("thread: header writen failed");
-        goto done;
-      }
-
-      break;
-    }
+  header_len = get_header_len(*target_fd, "\r\n\r\n");
+  if (header_len <= 0) {
+    perror("Error get_header_len");
+    goto done;
+  }
+  if ((red = readn(*target_fd, buffer, header_len)) < header_len) {
+    perror("Error getting header readn");
+    goto done;
+  }
+  buffer[red] = '\0';
+  printf("%s", buffer);
+  ssize_t wrote;
+  if ((wrote = writen(client_fd, buffer, header_len)) < header_len) {
+    perror("Error getting header writen");
+    printf("wrote = %zu\n", wrote);
+    goto done;
   }
 
   body = has_body(buffer, header_len);
 
   ssize_t chunk_size;
 
-  /* Overflow might be bigger than one chunk
-     Keep looking for last chunk size value read */
-  if (body == BODY_CHUNKED && overflow > 0) {
-    char* end_ptr;
-    char* position = post_header;
-    for (size_t size = 0; size < overflow; size += chunk_size) {
-      chunk_size = strtol(position, &end_ptr, 16);
-      chunk_size += 4 + end_ptr - position;
-      position += chunk_size;
-    }
-    if (chunk_size == 5 && strcmp(position - 5, "0\r\n\r\n") == 0) {
-      goto done;
-    }
-    chunk_size -= overflow;
-  } else if (body == BODY_CHUNKED) {
+  // if (body == BODY_CHUNKED && overflow > 0) {
+  // char* end_ptr;
+  // char* position = post_header;
+  // for (size_t size = 0; size < overflow; size += chunk_size) {
+  // chunk_size = strtol(position, &end_ptr, 16);
+  // chunk_size += 4 + end_ptr - position;
+  // position += chunk_size;
+  // }
+  // if (chunk_size == 5 && strcmp(position - 5, "0\r\n\r\n") == 0) {
+  // goto done;
+  // }
+  // chunk_size -= overflow;
+  // }
+  if (body == BODY_CHUNKED) {
     if ((chunk_size = http_get_next_chunk(*target_fd)) == -1) {
       goto done;
     }
-  }
-
-  if (body == BODY_LENGTH) {
+  } else if (body == BODY_LENGTH) {
     chunk_size = http_get_content_length(buffer);
-    chunk_size -= overflow;
     printf("CHUUUUNK ========= %zd\n", chunk_size);
     if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, *target_fd, client_fd,
                         chunk_size) <= 0) {
@@ -199,13 +180,13 @@ void* thread_func(void* args_) {
   }
 
 done:
-  close(*target_fd);
-  free(buffer);
   pthread_mutex_lock(&mutex);
   isDone = true;
   puts("Sending finish signal");
   pthread_cond_signal(&cond);
   pthread_mutex_unlock(&mutex);
+  close(*target_fd);
+  free(buffer);
   pthread_exit(NULL);
 }
 
@@ -381,60 +362,139 @@ void handle_files_request(int fd) {
  */
 void handle_proxy_request(int client_fd) {
   // Create a second thread to RECEIVE data from target server
+  errno = 0;
   pthread_t receive_thread;
   int target_fd = -99;
   ARGS args = {.target_fd_adr = &target_fd, .client_fd = client_fd};
-  pthread_cond_init(&cond, NULL);
-  pthread_mutex_init(&mutex, NULL);
+
+  if (pthread_cond_init(&cond, NULL) != 0 ||
+      pthread_mutex_init(&mutex, NULL) != 0) {
+    perror("can't initialize mutex");
+    exit(-1);
+  }
 
   // Let main thread handle data SENDING to target server
-  char buffer[LIBHTTP_REQUEST_MAX_SIZE];
-  ssize_t red = 0;
-  while (1) {
-    red = read(client_fd, buffer, LIBHTTP_REQUEST_MAX_SIZE);
-    if (red <= 0) {
-      perror("Error reading request from client");
-      break;
-    }
-    pthread_create(&receive_thread, NULL, &thread_func, &args);
-    pthread_mutex_lock(&mutex);
-    while (!isMade) {
-      pthread_cond_wait(&cond, &mutex);
-    }
-    isMade = false;
-    pthread_mutex_unlock(&mutex);
+  char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
+  ssize_t red;
+  // Can't send to target_fd until thread sets it up
+  if (pthread_create(&receive_thread, NULL, &thread_func, &args) != 0) {
+    perror("Failed to create thread");
+    goto done;
+  }
+  pthread_mutex_lock(&mutex);
+  while (target_fd == -99) {
+    pthread_cond_wait(&cond, &mutex);
+  }
+  pthread_mutex_unlock(&mutex);
+  //-----------------
+  ssize_t offset = 0;
+  ssize_t pre_host_len = get_header_len(client_fd, "Host: ");
+  if (pre_host_len <= 0) {
+    if (pre_host_len < 0) perror("Error getting pre_host_len");
+    goto done;
+  }
 
-    // Replace Host header with the target server's hostname
-    char* host_field = strstr(buffer, "Host:");
-    char* post_host_field = buffer;
-    buffer[red] = '\0';
+  // We want the length before the Host field
+  pre_host_len -= strlen("Host: ");
 
-    if (host_field) {
-      // Plus 2 to skip \r\n
-      post_host_field = strstr(host_field, "\r\n") + 2;
-      if (writen(target_fd, buffer, host_field - buffer) == -1) {
-        perror("send reqline: writen failed");
-      }
-      printf("%.*s", (int)(host_field - buffer), buffer);
-      http_send_header(target_fd, "Host", server_proxy_hostname);
+  if ((red = readn(client_fd, buffer, pre_host_len)) < pre_host_len) {
+    perror("Error pre_host readn");
+    goto done;
+  }
+  buffer[red] = '\0';
+  strcat(buffer, "Host: ");
+  strcat(buffer, server_proxy_hostname);
+  strcat(buffer, "\r\n");
+  offset += strlen(buffer);
+  // printf("%s", buffer);
+  ssize_t wrote;
+  if ((wrote = writen(target_fd, buffer, offset)) < offset) {
+    perror("Error host writen");
+    printf("fd = %d, wrote = %zu\n", target_fd, wrote);
+    goto done;
+  }
+  // This will skip the remaining of the Host field.
+  // We don't write this, just skipt it.
+  ssize_t host_len = get_header_len(client_fd, "\r\n");
+  if ((red = readn(client_fd, buffer + offset, host_len)) < host_len) {
+    perror("Error host_len readn");
+    goto done;
+  }
+  buffer[offset + host_len] = '\0';
+  // printf("%s", buffer);
+
+  // Send rest of the request.
+  // Use SAME offset from above because we want to override the
+  // unsent Host field
+  ssize_t post_host_len = get_header_len(client_fd, "\r\n\r\n");
+  if ((red = readn(client_fd, buffer + offset, post_host_len)) <
+      post_host_len) {
+    perror("Error post_host readn");
+    goto done;
+  }
+  buffer[offset + post_host_len] = '\0';
+  if (writen(target_fd, buffer + offset, red) < red) {
+    perror("Error post_host writen");
+    goto done;
+  }
+  offset += red;
+  printf("%s", buffer);
+  enum body_enum body = has_body(buffer, offset);
+  ssize_t chunk_size;
+
+  if (body == BODY_CHUNKED) {
+    if ((chunk_size = http_get_next_chunk(client_fd)) == -1) {
+      goto done;
     }
-    if (writen(target_fd, post_host_field, strlen(post_host_field)) == -1) {
-      perror("writen failed");
-    }
-    pthread_mutex_lock(&mutex);
-    while (!isDone) {
-      pthread_cond_wait(&cond, &mutex);
-    }
-    isDone = false;
-    pthread_mutex_unlock(&mutex);
-    char* check = buffer + red - 4;
-    // TODO: Change this because what if message has body (POST method)
-    if (strncmp(check, "\r\n\r\n", 4) == 0) {
-      break;
+  } else if (body == BODY_LENGTH) {
+    chunk_size = http_get_content_length(buffer);
+    printf("CHUUUUNK ========= %zd\n", chunk_size);
+    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd, target_fd,
+                        chunk_size) <= 0) {
+      perror("Error sending Content-Length message");
+      goto done;
     }
   }
+  while (body == BODY_CHUNKED) {
+    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd, target_fd,
+                        chunk_size) <= 0) {
+      perror("Error sending chunk");
+      goto done;
+    }
+    // Don't get more chunks if we sent the last one.
+    if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
+      goto done;
+    }
+    chunk_size = http_get_next_chunk(client_fd);
+  }
+  // /------------------
+
+  // // Replace Host header with the target server's hostname
+  // char* host_field = strstr(buffer, "Host:");
+  // char* post_host_field = buffer;
+  //
+  // if (host_field) {
+  // // Plus 2 to skip \r\n
+  // if (writen(target_fd, buffer, host_field - buffer) == -1) {
+  // perror("send reqline: writen failed");
+  // }
+  // printf("%.*s", (int)(host_field - buffer), buffer);
+  // http_send_header(target_fd, "Host", server_proxy_hostname);
+  // }
+  //
+  // post_host_field = strstr(host_field, "\r\n") + 2;
+  // if (writen(target_fd, post_host_field, strlen(post_host_field)) == -1)
+  // { perror("writen failed"); break;
+  // }
+  pthread_mutex_lock(&mutex);
+  while (!isDone) {
+    pthread_cond_wait(&cond, &mutex);
+  }
+  isDone = false;
+  pthread_mutex_unlock(&mutex);
+done:
   close(client_fd);
-  printf("CLOOOOOOOOOOOOOOOOSING %d\n", client_fd);
+  printf("CLOOOOOOOOOOOOOOOOSING socket %d\n", client_fd);
 }
 
 #ifdef POOLSERVER
