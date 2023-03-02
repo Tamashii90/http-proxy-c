@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <wchar.h>
 
@@ -139,19 +140,6 @@ void* thread_func(void* args_) {
 
   ssize_t chunk_size;
 
-  // if (body == BODY_CHUNKED && overflow > 0) {
-  // char* end_ptr;
-  // char* position = post_header;
-  // for (size_t size = 0; size < overflow; size += chunk_size) {
-  // chunk_size = strtol(position, &end_ptr, 16);
-  // chunk_size += 4 + end_ptr - position;
-  // position += chunk_size;
-  // }
-  // if (chunk_size == 5 && strcmp(position - 5, "0\r\n\r\n") == 0) {
-  // goto done;
-  // }
-  // chunk_size -= overflow;
-  // }
   if (body == BODY_CHUNKED) {
     if ((chunk_size = http_get_next_chunk(*target_fd)) == -1) {
       goto done;
@@ -413,6 +401,7 @@ void handle_proxy_request(int client_fd) {
     printf("fd = %d, wrote = %zu\n", target_fd, wrote);
     goto done;
   }
+  printf("%s\n", buffer);
   // This will skip the remaining of the Host field.
   // We don't write this, just skipt it.
   ssize_t host_len = get_header_len(client_fd, "\r\n");
@@ -421,7 +410,6 @@ void handle_proxy_request(int client_fd) {
     goto done;
   }
   buffer[offset + host_len] = '\0';
-  // printf("%s", buffer);
 
   // Send rest of the request.
   // Use SAME offset from above because we want to override the
@@ -438,7 +426,7 @@ void handle_proxy_request(int client_fd) {
     goto done;
   }
   offset += red;
-  printf("%s", buffer);
+  // printf("%s", buffer);
   enum body_enum body = has_body(buffer, offset);
   ssize_t chunk_size;
 
@@ -455,6 +443,7 @@ void handle_proxy_request(int client_fd) {
       goto done;
     }
   }
+
   while (body == BODY_CHUNKED) {
     if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd, target_fd,
                         chunk_size) <= 0) {
@@ -467,29 +456,9 @@ void handle_proxy_request(int client_fd) {
     }
     chunk_size = http_get_next_chunk(client_fd);
   }
-  // /------------------
 
-  // // Replace Host header with the target server's hostname
-  // char* host_field = strstr(buffer, "Host:");
-  // char* post_host_field = buffer;
-  //
-  // if (host_field) {
-  // // Plus 2 to skip \r\n
-  // if (writen(target_fd, buffer, host_field - buffer) == -1) {
-  // perror("send reqline: writen failed");
-  // }
-  // printf("%.*s", (int)(host_field - buffer), buffer);
-  // http_send_header(target_fd, "Host", server_proxy_hostname);
-  // }
-  //
-  // post_host_field = strstr(host_field, "\r\n") + 2;
-  // if (writen(target_fd, post_host_field, strlen(post_host_field)) == -1)
-  // { perror("writen failed"); break;
-  // }
   pthread_mutex_lock(&mutex);
-  while (!isDone) {
-    pthread_cond_wait(&cond, &mutex);
-  }
+  while (!isDone) pthread_cond_wait(&cond, &mutex);
   isDone = false;
   pthread_mutex_unlock(&mutex);
 done:
@@ -627,6 +596,8 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
     if (child_pid == 0) {
       request_handler(client_socket_number);
       exit(0);
+    } else {
+      close(client_socket_number);
     }
 
 #elif THREADSERVER

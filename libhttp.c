@@ -19,7 +19,7 @@ ssize_t writen(int fd, const void* buffer, size_t n) {
   errno = 0;
   ssize_t wrote;
   size_t total;
-  const char* it;
+  const unsigned char* it;
 
   it = buffer;
   for (total = 0; total < n;) {
@@ -43,7 +43,7 @@ ssize_t readn(int fd, void* buffer, size_t n) {
   errno = 0;
   ssize_t red;
   size_t total;
-  char* it;
+  unsigned char* it;
 
   it = buffer;
   for (total = 0; total < n;) {
@@ -97,7 +97,7 @@ int relay_large_msg(char* buffer, size_t max_size, int from, int to,
       read_size = max_size;
     }
   }
-  printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total, msg_size);
+  // printf("BREEEEEEEEEAK! red (%zu) and wanted (%zu)\n", total, msg_size);
   return total == msg_size;
 }
 
@@ -108,7 +108,7 @@ ssize_t get_header_len(int fd, char* target) {
   ssize_t header_len;
 
   for (size_t total = 0; total < LIBHTTP_REQUEST_MAX_SIZE;) {
-    // Get header length. Don't forget MSG_PEEK flag.
+    // Get header length. Don't forget the MSG_PEEK flag.
     if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE, MSG_PEEK)) <= 0) {
       if (red == 0) return 0;
       perror("Error get_header_len recv");
