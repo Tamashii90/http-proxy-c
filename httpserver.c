@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <asm-generic/socket.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -36,145 +37,206 @@ int backlog;
 char* server_files_directory;
 char* server_proxy_hostname;
 int server_proxy_port;
-pthread_cond_t cond;
-pthread_mutex_t mutex;
-bool isDone = false;
-bool isMade = false;
+bool is_working;
 
 typedef struct {
   int client_fd;
-  int* target_fd_adr;
+  int target_fd;
+  bool* is_done_client;
+  bool* is_done_target;
+  pthread_cond_t* cond;
+  pthread_mutex_t* mutex;
 } ARGS;
 
-void* thread_func(void* args_) {
+void* proxy_client(void* args_) {
   ARGS* args = (ARGS*)args_;
   int client_fd = args->client_fd;
-  int* target_fd = args->target_fd_adr;
-  // Create an IPv4 TCP socket to communicate with the proxy target.
-  *target_fd = socket(PF_INET, SOCK_STREAM, 0);
-  if (*target_fd == -1) {
-    fprintf(stderr, "Failed to create a new socket: error %d: %s\n", errno,
-            strerror(errno));
-    close(client_fd);
-    exit(errno);
-  }
+  int target_fd = args->target_fd;
+  bool* is_done_client = args->is_done_client;
 
-  // So that reading more than the server sent doesn't cause
-  // the read() to block for long
-  // struct timeval timeout = {.tv_sec = 3, .tv_usec = 000000};
-  // if (setsockopt(*target_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-  // sizeof(timeout)) < 0) {
-  // perror("setsockopt failed");
+  char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
+  ssize_t red;
+
+  do {
+    ssize_t offset = 0;
+    // puts("Client waiting get_header_len");
+    ssize_t pre_host_len = get_header_len(client_fd, "Host: ");
+    if (pre_host_len <= 0) {
+      if (pre_host_len < 0) perror("Error getting pre_host_len");
+      break;
+    }
+    // puts("Red client header");
+
+    // We want the length before the Host field
+    pre_host_len -= strlen("Host: ");
+
+    if ((red = readn(client_fd, buffer, pre_host_len)) < pre_host_len) {
+      perror("Error pre_host readn");
+      break;
+    }
+    buffer[red] = '\0';
+    strcat(buffer, "Host: ");
+    strcat(buffer, server_proxy_hostname);
+    strcat(buffer, "\r\n");
+    offset += strlen(buffer);
+    // printf("%s", buffer);
+    ssize_t wrote;
+    if ((wrote = writen(target_fd, buffer, offset)) < offset) {
+      perror("Error client writeN");
+      printf("fd = %d, wrote = %zu\n", target_fd, wrote);
+      break;
+    }
+    printf("%s\n", buffer);
+    // This will skip the remaining of the Host field.
+    // We don't write this, just skipt it.
+    ssize_t host_len = get_header_len(client_fd, "\r\n");
+    if ((red = readn(client_fd, buffer + offset, host_len)) < host_len) {
+      perror("Error host_len readn");
+      break;
+    }
+    buffer[offset + host_len] = '\0';
+
+    // Send rest of the request.
+    // Use SAME offset from above because we want to override the
+    // unsent Host field
+    ssize_t post_host_len = get_header_len(client_fd, "\r\n\r\n");
+    if ((red = readn(client_fd, buffer + offset, post_host_len)) <
+        post_host_len) {
+      perror("Error post_host readn");
+      break;
+    }
+    buffer[offset + post_host_len] = '\0';
+    if (writen(target_fd, buffer + offset, red) < red) {
+      perror("Error post_host writen");
+      break;
+    }
+    offset += red;
+    // printf("%s", buffer);
+    enum body_enum body = has_body(buffer, offset);
+    ssize_t chunk_size;
+
+    if (body == BODY_CHUNKED) {
+      if ((chunk_size = http_get_next_chunk(client_fd)) == -1) {
+        break;
+      }
+    } else if (body == BODY_LENGTH) {
+      chunk_size = http_get_content_length(buffer);
+      printf("CHUUUUNK ========= %zd\n", chunk_size);
+      if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd,
+                          target_fd, chunk_size) <= 0) {
+        perror("Error sending Content-Length message");
+        break;
+      }
+    }
+
+    while (body == BODY_CHUNKED) {
+      if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd,
+                          target_fd, chunk_size) <= 0) {
+        perror("Error sending chunk");
+        break;
+      }
+      // Don't get more chunks if we sent the last one.
+      if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
+        break;
+      }
+      chunk_size = http_get_next_chunk(client_fd);
+    }
+    // pthread_mutex_lock(&mutex);
+    // while (!is_done_target) pthread_cond_wait(&cond, &mutex);
+    // is_done_target = false;
+    // pthread_mutex_unlock(&mutex);
+  } while (1);
+  pthread_mutex_lock(args->mutex);
+  *is_done_client = true;
+  pthread_cond_signal(args->cond);
+  pthread_mutex_unlock(args->mutex);
+  // shutdown(client_fd, SHUT_RD);
+  // shutdown(target_fd, SHUT_WR);
+  // if (close(target_fd) < 0) {
+  // puts("Error closing target_fd");
   // }
+  // close(client_fd);
+  puts("Client Finished!");
+  pthread_exit(NULL);
+}
 
-  /*
-   * The code below does a DNS lookup of server_proxy_hostname and
-   * opens a connection to it. Please do not modify.
-   */
-  struct sockaddr_in target_address;
-  memset(&target_address, 0, sizeof(target_address));
-  target_address.sin_family = AF_INET;
-  target_address.sin_port = htons(server_proxy_port);
+void* proxy_target(void* args_) {
+  ARGS* args = (ARGS*)args_;
+  int client_fd = args->client_fd;
+  int target_fd = args->target_fd;
+  bool* is_done_target = args->is_done_target;
 
-  // Use DNS to resolve the proxy target's IP address
-  struct hostent* target_dns_entry =
-      gethostbyname2(server_proxy_hostname, AF_INET);
-
-  if (target_dns_entry == NULL) {
-    fprintf(stderr, "Cannot find host: %s\n", server_proxy_hostname);
-    close(*target_fd);
-    close(client_fd);
-    exit(ENXIO);
-  }
-
-  char* dns_address = target_dns_entry->h_addr_list[0];
-
-  // Connect to the proxy target.
-  memcpy(&target_address.sin_addr, dns_address,
-         sizeof(target_address.sin_addr));
-  int connection_status = connect(*target_fd, (struct sockaddr*)&target_address,
-                                  sizeof(target_address));
-
-  if (connection_status < 0) {
-    /* Dummy request parsing, just to be compliant. */
-    struct http_request* req = http_request_parse(client_fd);
-
-    http_start_response(client_fd, 502);
-    http_send_header(client_fd, "Content-Type", "text/html");
-    http_end_headers(client_fd);
-    free(req);
-    close(*target_fd);
-    close(client_fd);
-    pthread_exit(NULL);
-  }
-  pthread_mutex_lock(&mutex);
-  // isMade = true;
-  pthread_cond_signal(&cond);
-  pthread_mutex_unlock(&mutex);
-
-  char* buffer = malloc(LIBHTTP_REQUEST_MAX_SIZE + 1);
+  char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
   ssize_t header_len;
   ssize_t red;
   enum body_enum body;
 
-  // Read the HTTP header
-  header_len = get_header_len(*target_fd, "\r\n\r\n");
-  if (header_len <= 0) {
-    perror("Error get_header_len");
-    goto done;
-  }
-  if ((red = readn(*target_fd, buffer, header_len)) < header_len) {
-    perror("Error getting header readn");
-    goto done;
-  }
-  buffer[red] = '\0';
-  printf("%s", buffer);
-  ssize_t wrote;
-  if ((wrote = writen(client_fd, buffer, header_len)) < header_len) {
-    perror("Error getting header writen");
-    printf("wrote = %zu\n", wrote);
-    goto done;
-  }
-
-  body = has_body(buffer, header_len);
-
-  ssize_t chunk_size;
-
-  if (body == BODY_CHUNKED) {
-    if ((chunk_size = http_get_next_chunk(*target_fd)) == -1) {
-      goto done;
+  do {
+    // Read the HTTP header
+    // puts("Target waiting get_header_len");
+    header_len = get_header_len(target_fd, "\r\n\r\n");
+    if (header_len <= 0) {
+      if (header_len < 0) perror("Error get_header_len");
+      break;
     }
-  } else if (body == BODY_LENGTH) {
-    chunk_size = http_get_content_length(buffer);
-    printf("CHUUUUNK ========= %zd\n", chunk_size);
-    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, *target_fd, client_fd,
-                        chunk_size) <= 0) {
-      perror("Error sending Content-Length message");
-      goto done;
+    // puts("Red target header");
+    if ((red = readn(target_fd, buffer, header_len)) < header_len) {
+      perror("Error getting header readn");
+      break;
     }
-  }
+    buffer[red] = '\0';
+    printf("%s", buffer);
+    ssize_t wrote;
+    if ((wrote = writen(client_fd, buffer, header_len)) < header_len) {
+      perror("Error getting header writen");
+      printf("wrote = %zu\n", wrote);
+      break;
+    }
 
-  while (body == BODY_CHUNKED) {
-    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, *target_fd, client_fd,
-                        chunk_size) <= 0) {
-      perror("Error sending chunk");
-      goto done;
-    }
-    // Don't get more chunks if we sent the last one.
-    if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
-      goto done;
-    }
-    chunk_size = http_get_next_chunk(*target_fd);
-  }
+    body = has_body(buffer, header_len);
 
-done:
-  pthread_mutex_lock(&mutex);
-  isDone = true;
-  puts("Sending finish signal");
-  pthread_cond_signal(&cond);
-  pthread_mutex_unlock(&mutex);
-  close(*target_fd);
-  free(buffer);
+    ssize_t chunk_size;
+
+    if (body == BODY_LENGTH) {
+      chunk_size = http_get_content_length(buffer);
+      printf("CHUUUUNK ========= %zd\n", chunk_size);
+      if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, target_fd,
+                          client_fd, chunk_size) <= 0) {
+        perror("Error sending Content-Length message");
+        break;
+      }
+    }
+
+    while (body == BODY_CHUNKED) {
+      // puts("inner looop thread");
+      chunk_size = http_get_next_chunk(target_fd);
+      if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, target_fd,
+                          client_fd, chunk_size) <= 0) {
+        perror("Error sending chunk");
+        break;
+      }
+      // Don't get more chunks if we sent the last one.
+      if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
+        break;
+      }
+    }
+    // pthread_mutex_lock(&mutex);
+    // while (!is_done_target) pthread_cond_wait(&cond, &mutex);
+    // is_done_target = false;
+    // pthread_mutex_unlock(&mutex);
+  } while (1);
+
+  pthread_mutex_lock(args->mutex);
+  *is_done_target = true;
+  pthread_cond_signal(args->cond);
+  pthread_mutex_unlock(args->mutex);
+  // shutdown(client_fd, SHUT_WR);
+  // shutdown(target_fd, SHUT_RD);
+  // if (close(client_fd) < 0) {
+  // perror("Erro closing client_fd");
+  // }
+  // close(target_fd);
+  puts("Target Finished!");
   pthread_exit(NULL);
 }
 
@@ -349,121 +411,112 @@ void handle_files_request(int fd) {
  * when finished.
  */
 void handle_proxy_request(int client_fd) {
-  // Create a second thread to RECEIVE data from target server
-  errno = 0;
-  pthread_t receive_thread;
-  int target_fd = -99;
-  ARGS args = {.target_fd_adr = &target_fd, .client_fd = client_fd};
+  /*
+   * The code below does a DNS lookup of server_proxy_hostname and
+   * opens a connection to it. Please do not modify.
+   */
+  struct sockaddr_in target_address;
+  memset(&target_address, 0, sizeof(target_address));
+  target_address.sin_family = AF_INET;
+  target_address.sin_port = htons(server_proxy_port);
 
-  if (pthread_cond_init(&cond, NULL) != 0 ||
-      pthread_mutex_init(&mutex, NULL) != 0) {
-    perror("can't initialize mutex");
-    exit(-1);
-  }
+  // Use DNS to resolve the proxy target's IP address
+  struct hostent* target_dns_entry =
+      gethostbyname2(server_proxy_hostname, AF_INET);
 
-  // Let main thread handle data SENDING to target server
-  char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
-  ssize_t red;
-  // Can't send to target_fd until thread sets it up
-  if (pthread_create(&receive_thread, NULL, &thread_func, &args) != 0) {
-    perror("Failed to create thread");
-    goto done;
-  }
-  pthread_mutex_lock(&mutex);
-  while (target_fd == -99) {
-    pthread_cond_wait(&cond, &mutex);
-  }
-  pthread_mutex_unlock(&mutex);
-  //-----------------
-  ssize_t offset = 0;
-  ssize_t pre_host_len = get_header_len(client_fd, "Host: ");
-  if (pre_host_len <= 0) {
-    if (pre_host_len < 0) perror("Error getting pre_host_len");
-    goto done;
+  // Create an IPv4 TCP socket to communicate with the proxy target.
+  int target_fd = socket(PF_INET, SOCK_STREAM, 0);
+  if (target_fd == -1) {
+    fprintf(stderr, "Failed to create a new socket: error %d: %s\n", errno,
+            strerror(errno));
+    close(client_fd);
+    exit(errno);
   }
 
-  // We want the length before the Host field
-  pre_host_len -= strlen("Host: ");
-
-  if ((red = readn(client_fd, buffer, pre_host_len)) < pre_host_len) {
-    perror("Error pre_host readn");
-    goto done;
-  }
-  buffer[red] = '\0';
-  strcat(buffer, "Host: ");
-  strcat(buffer, server_proxy_hostname);
-  strcat(buffer, "\r\n");
-  offset += strlen(buffer);
-  // printf("%s", buffer);
-  ssize_t wrote;
-  if ((wrote = writen(target_fd, buffer, offset)) < offset) {
-    perror("Error host writen");
-    printf("fd = %d, wrote = %zu\n", target_fd, wrote);
-    goto done;
-  }
-  printf("%s\n", buffer);
-  // This will skip the remaining of the Host field.
-  // We don't write this, just skipt it.
-  ssize_t host_len = get_header_len(client_fd, "\r\n");
-  if ((red = readn(client_fd, buffer + offset, host_len)) < host_len) {
-    perror("Error host_len readn");
-    goto done;
-  }
-  buffer[offset + host_len] = '\0';
-
-  // Send rest of the request.
-  // Use SAME offset from above because we want to override the
-  // unsent Host field
-  ssize_t post_host_len = get_header_len(client_fd, "\r\n\r\n");
-  if ((red = readn(client_fd, buffer + offset, post_host_len)) <
-      post_host_len) {
-    perror("Error post_host readn");
-    goto done;
-  }
-  buffer[offset + post_host_len] = '\0';
-  if (writen(target_fd, buffer + offset, red) < red) {
-    perror("Error post_host writen");
-    goto done;
-  }
-  offset += red;
-  // printf("%s", buffer);
-  enum body_enum body = has_body(buffer, offset);
-  ssize_t chunk_size;
-
-  if (body == BODY_CHUNKED) {
-    if ((chunk_size = http_get_next_chunk(client_fd)) == -1) {
-      goto done;
-    }
-  } else if (body == BODY_LENGTH) {
-    chunk_size = http_get_content_length(buffer);
-    printf("CHUUUUNK ========= %zd\n", chunk_size);
-    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd, target_fd,
-                        chunk_size) <= 0) {
-      perror("Error sending Content-Length message");
-      goto done;
-    }
+  if (target_dns_entry == NULL) {
+    fprintf(stderr, "Cannot find host: %s\n", server_proxy_hostname);
+    close(target_fd);
+    close(client_fd);
+    exit(ENXIO);
   }
 
-  while (body == BODY_CHUNKED) {
-    if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd, target_fd,
-                        chunk_size) <= 0) {
-      perror("Error sending chunk");
-      goto done;
-    }
-    // Don't get more chunks if we sent the last one.
-    if (chunk_size == 5 && memcmp(buffer, "0\r\n\r\n", 5) == 0) {
-      goto done;
-    }
-    chunk_size = http_get_next_chunk(client_fd);
+  char* dns_address = target_dns_entry->h_addr_list[0];
+
+  // Connect to the proxy target.
+  memcpy(&target_address.sin_addr, dns_address,
+         sizeof(target_address.sin_addr));
+  int connection_status = connect(target_fd, (struct sockaddr*)&target_address,
+                                  sizeof(target_address));
+
+  if (connection_status < 0) {
+    /* Dummy request parsing, just to be compliant. */
+    struct http_request* req = http_request_parse(client_fd);
+
+    http_start_response(client_fd, 502);
+    http_send_header(client_fd, "Content-Type", "text/html");
+    http_end_headers(client_fd);
+    free(req);
+    close(target_fd);
+    close(client_fd);
+    return;
   }
+
+  struct timeval timeout = {.tv_sec = 30, .tv_usec = 000000};
+  if (setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                 sizeof(timeout)) < 0) {
+    perror("setsockopt failed");
+  }
+
+  if (setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                 sizeof(timeout)) < 0) {
+    perror("setsockopt failed");
+  }
+
+  pthread_t client_thread;
+  pthread_t target_thread;
+  pthread_cond_t cond;
+  pthread_mutex_t mutex;
+  bool is_done_client = false;
+  bool is_done_target = false;
+  ARGS args_client = {.client_fd = client_fd,
+                      .target_fd = target_fd,
+                      .is_done_client = &is_done_client,
+                      .cond = &cond,
+                      .mutex = &mutex};
+  ARGS args_target = {.client_fd = client_fd,
+                      .target_fd = target_fd,
+                      .is_done_target = &is_done_target,
+                      .cond = &cond,
+                      .mutex = &mutex};
+
+  pthread_mutex_init(&mutex, NULL);
+  pthread_cond_init(&cond, NULL);
+
+  pthread_create(&client_thread, NULL, proxy_client, &args_client);
+  pthread_create(&target_thread, NULL, proxy_target, &args_target);
 
   pthread_mutex_lock(&mutex);
-  while (!isDone) pthread_cond_wait(&cond, &mutex);
-  isDone = false;
+  while (!is_done_client && !is_done_target) pthread_cond_wait(&cond, &mutex);
   pthread_mutex_unlock(&mutex);
-done:
+
+  if (!is_done_target && pthread_cancel(target_thread) != 0) {
+    perror("Error cancelling target_thread");
+  }
+  if (!is_done_client && pthread_cancel(client_thread) != 0) {
+    perror("Error cancelling client_thread");
+  }
+
+  if (pthread_join(target_thread, NULL)) {
+    perror("Error Joining target_thread");
+  }
+  if (pthread_join(client_thread, NULL)) {
+    perror("Error Joining client_thread");
+  }
+
   close(client_fd);
-  printf("CLOOOOOOOOOOOOOOOOSING socket %d\n", client_fd);
+  close(target_fd);
+
+  // puts("CLOOOOOOOOOOOOOOSING");
 }
 
 #ifdef POOLSERVER
@@ -602,8 +655,6 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
 
 #elif THREADSERVER
     /*
-     * TODO: PART 6
-     *
      * When a client connection has been accepted, a new
      * thread is created. This thread will send a response
      * to the client. The main thread should continue
@@ -611,9 +662,13 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
      * thread will NOT be joining with the new thread.
      */
 
-    /* PART 6 BEGIN */
+    pthread_t thread;
+    pthread_create(&thread, NULL, (void*)request_handler,
+                   (void*)client_socket_number);
 
-    /* PART 6 END */
+    // We won't join on it
+    pthread_detach(thread);
+
 #elif POOLSERVER
     /*
      * TODO: PART 7
