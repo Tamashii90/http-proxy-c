@@ -26,17 +26,14 @@
 
 /*
  * Global configuration variables.
- * You need to use these in your implementation of handle_files_request and
- * handle_proxy_request. Their values are set up in main() using the
- * command line arguments (already implemented for you).
+ * Values are set up in main() using the
+ * command line arguments.
  */
 wq_t work_queue;  // Only used by poolserver
 int num_threads;  // Only used by poolserver
 int server_port;  // Default value: 8000
 int backlog;
 char* server_files_directory;
-char* server_proxy_hostname;
-int server_proxy_port;
 bool is_working;
 
 typedef struct {
@@ -48,6 +45,105 @@ typedef struct {
   pthread_mutex_t* mutex;
 } ARGS;
 
+char* parse_host_name(int fd) {
+  char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
+  ssize_t red;
+  char* begin;
+  char* end;
+  char* host;
+
+  for (size_t total = 0; total < LIBHTTP_REQUEST_MAX_SIZE;) {
+    // Don't forget the MSG_PEEK flag.
+    if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE - total, MSG_PEEK)) <=
+        0) {
+      if (red == 0) return 0;
+      perror("Error parse_host_name recv");
+      return NULL;
+    }
+    total += red;
+    buffer[total] = '\0';
+
+    // Change to lowercase because some servers don't capitalize the H in Host
+    str_to_lower(buffer, red);
+
+    if ((begin = strstr(buffer, "host: ")) != NULL) {
+      /*
+       * Host field has the format "Host: mywebsite.com:80\r\n"
+       * Port number is optional
+       */
+      begin += strlen("host: ");
+      if ((end = strchr(begin, '\r')) != NULL) {
+        void* colon = NULL;
+        // Must use strchr or it will search all of the header
+        if ((colon = memchr(begin, ':', end - begin)) != NULL) {
+          end = colon;
+        }
+        host = malloc(end - begin + 1);
+        strncpy(host, begin, end - begin);
+        host[end - begin] = '\0';
+        return host;
+      }
+    }
+  }
+  return NULL;
+}
+
+int connect_target(int client_fd, char* server_proxy_hostname) {
+  /*
+   * The code below does a DNS lookup of server_proxy_hostname and
+   * opens a connection to it. Please do not modify.
+   */
+  int target_fd;
+  int server_proxy_port = 80;
+  struct sockaddr_in target_address;
+
+  if (server_proxy_hostname == NULL) {
+    puts("Hostname is null..");
+    return -1;
+  }
+
+  memset(&target_address, 0, sizeof(target_address));
+  target_address.sin_family = AF_INET;
+  target_address.sin_port = htons(server_proxy_port);
+
+  // Use DNS to resolve the proxy target's IP address
+  struct hostent* target_dns_entry =
+      gethostbyname2(server_proxy_hostname, AF_INET);
+
+  // Create an IPv4 TCP socket to communicate with the proxy target.
+  target_fd = socket(PF_INET, SOCK_STREAM, 0);
+  if (target_fd == -1) {
+    fprintf(stderr, "Failed to create a new socket: error %d: %s\n", errno,
+            strerror(errno));
+    close(client_fd);
+    exit(errno);
+  }
+
+  if (target_dns_entry == NULL) {
+    fprintf(stderr, "Cannot find host: %s\n", server_proxy_hostname);
+    close(target_fd);
+    close(client_fd);
+    exit(ENXIO);
+  }
+
+  char* dns_address = target_dns_entry->h_addr_list[0];
+
+  // Connect to the proxy target.
+  memcpy(&target_address.sin_addr, dns_address,
+         sizeof(target_address.sin_addr));
+  int connection_status = connect(target_fd, (struct sockaddr*)&target_address,
+                                  sizeof(target_address));
+
+  if (connection_status < 0) {
+    /* Dummy request parsing, just to be compliant. */
+    struct http_request* req = http_request_parse(client_fd);
+    free(req);
+    return -1;
+  }
+
+  return target_fd;
+}
+
 void* proxy_client(void* args_) {
   ARGS* args = (ARGS*)args_;
   int client_fd = args->client_fd;
@@ -56,63 +152,31 @@ void* proxy_client(void* args_) {
 
   char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
   ssize_t red;
+  ssize_t header_len;
 
   do {
-    ssize_t offset = 0;
-    // puts("Client waiting get_header_len");
-    ssize_t pre_host_len = get_header_len(client_fd, "Host: ");
-    if (pre_host_len <= 0) {
-      if (pre_host_len < 0) perror("Error getting pre_host_len");
+    // Read the HTTP header
+    // puts("Target waiting get_header_len");
+    header_len = get_header_len(client_fd, "\r\n\r\n");
+    if (header_len <= 0) {
+      if (header_len < 0) perror("Error get_header_len");
       break;
     }
-    // puts("Red client header");
-
-    // We want the length before the Host field
-    pre_host_len -= strlen("Host: ");
-
-    if ((red = readn(client_fd, buffer, pre_host_len)) < pre_host_len) {
-      perror("Error pre_host readn");
+    // puts("Red target header");
+    if ((red = readn(client_fd, buffer, header_len)) < header_len) {
+      perror("Error getting header readn");
       break;
     }
     buffer[red] = '\0';
-    strcat(buffer, "Host: ");
-    strcat(buffer, server_proxy_hostname);
-    strcat(buffer, "\r\n");
-    offset += strlen(buffer);
-    // printf("%s", buffer);
+    printf("%s", buffer);
     ssize_t wrote;
-    if ((wrote = writen(target_fd, buffer, offset)) < offset) {
-      perror("Error client writeN");
-      printf("fd = %d, wrote = %zu\n", target_fd, wrote);
+    if ((wrote = writen(target_fd, buffer, header_len)) < header_len) {
+      perror("Error getting header writen");
+      printf("wrote = %zu\n", wrote);
       break;
     }
-    printf("%s\n", buffer);
-    // This will skip the remaining of the Host field.
-    // We don't write this, just skipt it.
-    ssize_t host_len = get_header_len(client_fd, "\r\n");
-    if ((red = readn(client_fd, buffer + offset, host_len)) < host_len) {
-      perror("Error host_len readn");
-      break;
-    }
-    buffer[offset + host_len] = '\0';
-
-    // Send rest of the request.
-    // Use SAME offset from above because we want to override the
-    // unsent Host field
-    ssize_t post_host_len = get_header_len(client_fd, "\r\n\r\n");
-    if ((red = readn(client_fd, buffer + offset, post_host_len)) <
-        post_host_len) {
-      perror("Error post_host readn");
-      break;
-    }
-    buffer[offset + post_host_len] = '\0';
-    if (writen(target_fd, buffer + offset, red) < red) {
-      perror("Error post_host writen");
-      break;
-    }
-    offset += red;
     // printf("%s", buffer);
-    enum body_enum body = has_body(buffer, offset);
+    enum body_enum body = has_body(buffer, header_len);
     ssize_t chunk_size;
 
     if (body == BODY_CHUNKED) {
@@ -121,7 +185,7 @@ void* proxy_client(void* args_) {
       }
     } else if (body == BODY_LENGTH) {
       chunk_size = http_get_content_length(buffer);
-      printf("CHUUUUNK ========= %zd\n", chunk_size);
+      // printf("CHUUUUNK ========= %zd\n", chunk_size);
       if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, client_fd,
                           target_fd, chunk_size) <= 0) {
         perror("Error sending Content-Length message");
@@ -199,7 +263,7 @@ void* proxy_target(void* args_) {
 
     if (body == BODY_LENGTH) {
       chunk_size = http_get_content_length(buffer);
-      printf("CHUUUUNK ========= %zd\n", chunk_size);
+      // printf("CHUUUUNK ========= %zd\n", chunk_size);
       if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, target_fd,
                           client_fd, chunk_size) <= 0) {
         perror("Error sending Content-Length message");
@@ -411,54 +475,19 @@ void handle_files_request(int fd) {
  * when finished.
  */
 void handle_proxy_request(int client_fd) {
-  /*
-   * The code below does a DNS lookup of server_proxy_hostname and
-   * opens a connection to it. Please do not modify.
-   */
-  struct sockaddr_in target_address;
-  memset(&target_address, 0, sizeof(target_address));
-  target_address.sin_family = AF_INET;
-  target_address.sin_port = htons(server_proxy_port);
+  int target_fd;
+  char* server_proxy_hostname;
 
-  // Use DNS to resolve the proxy target's IP address
-  struct hostent* target_dns_entry =
-      gethostbyname2(server_proxy_hostname, AF_INET);
-
-  // Create an IPv4 TCP socket to communicate with the proxy target.
-  int target_fd = socket(PF_INET, SOCK_STREAM, 0);
-  if (target_fd == -1) {
-    fprintf(stderr, "Failed to create a new socket: error %d: %s\n", errno,
-            strerror(errno));
-    close(client_fd);
-    exit(errno);
+  if ((server_proxy_hostname = parse_host_name(client_fd)) == NULL) {
+    puts("Couldn't parse hostname");
+    http_reject_response(client_fd, 400);
+    goto done;
   }
 
-  if (target_dns_entry == NULL) {
-    fprintf(stderr, "Cannot find host: %s\n", server_proxy_hostname);
-    close(target_fd);
-    close(client_fd);
-    exit(ENXIO);
-  }
-
-  char* dns_address = target_dns_entry->h_addr_list[0];
-
-  // Connect to the proxy target.
-  memcpy(&target_address.sin_addr, dns_address,
-         sizeof(target_address.sin_addr));
-  int connection_status = connect(target_fd, (struct sockaddr*)&target_address,
-                                  sizeof(target_address));
-
-  if (connection_status < 0) {
-    /* Dummy request parsing, just to be compliant. */
-    struct http_request* req = http_request_parse(client_fd);
-
-    http_start_response(client_fd, 502);
-    http_send_header(client_fd, "Content-Type", "text/html");
-    http_end_headers(client_fd);
-    free(req);
-    close(target_fd);
-    close(client_fd);
-    return;
+  if ((target_fd = connect_target(client_fd, server_proxy_hostname)) <= 0) {
+    puts("Couldn't connect to proxy target");
+    http_reject_response(client_fd, 502);
+    goto done;
   }
 
   struct timeval timeout = {.tv_sec = 20, .tv_usec = 000000};
@@ -513,10 +542,11 @@ void handle_proxy_request(int client_fd) {
     perror("Error Joining client_thread");
   }
 
+  printf("CLOOOOOOOOOOOOOOSING connection %d\n", client_fd);
+
+done:
   close(client_fd);
   close(target_fd);
-
-  printf("CLOOOOOOOOOOOOOOSING connection %d\n", client_fd);
 }
 
 #ifdef POOLSERVER
@@ -733,22 +763,6 @@ int main(int argc, char** argv) {
       }
     } else if (strcmp("--proxy", argv[i]) == 0) {
       request_handler = handle_proxy_request;
-
-      char* proxy_target = argv[++i];
-      if (!proxy_target) {
-        fprintf(stderr, "Expected argument after --proxy\n");
-        exit_with_usage();
-      }
-
-      char* colon_pointer = strchr(proxy_target, ':');
-      if (colon_pointer != NULL) {
-        *colon_pointer = '\0';
-        server_proxy_hostname = proxy_target;
-        server_proxy_port = atoi(colon_pointer + 1);
-      } else {
-        server_proxy_hostname = proxy_target;
-        server_proxy_port = 80;
-      }
     } else if (strcmp("--port", argv[i]) == 0) {
       char* server_port_string = argv[++i];
       if (!server_port_string) {
@@ -772,10 +786,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (server_files_directory == NULL && server_proxy_hostname == NULL) {
+  if (request_handler == NULL) {
     fprintf(stderr,
             "Please specify either \"--files [DIRECTORY]\" or \n"
-            "                      \"--proxy [HOSTNAME:PORT]\"\n");
+            "                      \"--proxy\"\n");
     exit_with_usage();
   }
 
@@ -791,3 +805,4 @@ int main(int argc, char** argv) {
 
   return EXIT_SUCCESS;
 }
+
