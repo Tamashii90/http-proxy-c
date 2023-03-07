@@ -43,6 +43,7 @@ typedef struct {
   bool* is_done_target;
   pthread_cond_t* cond;
   pthread_mutex_t* mutex;
+  char* server_proxy_hostname;
 } ARGS;
 
 char* parse_host_name(int fd) {
@@ -149,13 +150,18 @@ void* proxy_client(void* args_) {
   int client_fd = args->client_fd;
   int target_fd = args->target_fd;
   bool* is_done_client = args->is_done_client;
+  char* curr_host = args->server_proxy_hostname;
 
   char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
   ssize_t red;
   ssize_t header_len;
 
   do {
-    // Read the HTTP header
+    // If new host value appears, then close connection
+    char* new_host = parse_host_name(client_fd);
+    if (new_host == NULL || strcmp(new_host, curr_host) != 0) {
+      break;
+    }
     // puts("Target waiting get_header_len");
     header_len = get_header_len(client_fd, "\r\n\r\n");
     if (header_len <= 0) {
@@ -476,7 +482,7 @@ void handle_files_request(int fd) {
  */
 void handle_proxy_request(int client_fd) {
   int target_fd;
-  char* server_proxy_hostname;
+  char* server_proxy_hostname = NULL;
 
   if ((server_proxy_hostname = parse_host_name(client_fd)) == NULL) {
     puts("Couldn't parse hostname");
@@ -507,11 +513,14 @@ void handle_proxy_request(int client_fd) {
   pthread_mutex_t mutex;
   bool is_done_client = false;
   bool is_done_target = false;
+
+  // Pass hostname to client_thread so it can detect changes
   ARGS args_client = {.client_fd = client_fd,
                       .target_fd = target_fd,
                       .is_done_client = &is_done_client,
                       .cond = &cond,
-                      .mutex = &mutex};
+                      .mutex = &mutex,
+                      .server_proxy_hostname = server_proxy_hostname};
   ARGS args_target = {.client_fd = client_fd,
                       .target_fd = target_fd,
                       .is_done_target = &is_done_target,
@@ -524,6 +533,9 @@ void handle_proxy_request(int client_fd) {
   pthread_create(&client_thread, NULL, proxy_client, &args_client);
   pthread_create(&target_thread, NULL, proxy_target, &args_target);
 
+  /* As soon as one side of the connection closes (erroneously or not)
+   * then close the other side and re-open a new one
+   */
   pthread_mutex_lock(&mutex);
   while (!is_done_client && !is_done_target) pthread_cond_wait(&cond, &mutex);
   pthread_mutex_unlock(&mutex);
