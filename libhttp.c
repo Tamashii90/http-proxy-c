@@ -126,6 +126,7 @@ ssize_t get_header_len(int fd, char* target) {
     }
   }
   // Mustn't reach here if the request is well-formed.
+  puts("Error get_header_len: malformed request?");
   return -1;
 }
 

@@ -461,7 +461,7 @@ void handle_proxy_request(int client_fd) {
     return;
   }
 
-  struct timeval timeout = {.tv_sec = 30, .tv_usec = 000000};
+  struct timeval timeout = {.tv_sec = 20, .tv_usec = 000000};
   if (setsockopt(target_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                  sizeof(timeout)) < 0) {
     perror("setsockopt failed");
@@ -516,7 +516,7 @@ void handle_proxy_request(int client_fd) {
   close(client_fd);
   close(target_fd);
 
-  // puts("CLOOOOOOOOOOOOOOSING");
+  printf("CLOOOOOOOOOOOOOOSING connection %d\n", client_fd);
 }
 
 #ifdef POOLSERVER
@@ -532,20 +532,30 @@ void* handle_clients(void* void_request_handler) {
    * won't be joining on it. */
   pthread_detach(pthread_self());
 
-  /* TODO: PART 7 */
-  /* PART 7 BEGIN */
+  while (1) {
+    int fd = wq_pop(&work_queue);
+    request_handler(fd);
+  }
 
-  /* PART 7 END */
+  // Won't happen
+  puts("Exited worker thread?!");
+  pthread_exit(NULL);
 }
 
 /*
  * Creates `num_threads` amount of threads. Initializes the work queue.
  */
 void init_thread_pool(int num_threads, void (*request_handler)(int)) {
-  /* TODO: PART 7 */
-  /* PART 7 BEGIN */
-
-  /* PART 7 END */
+  wq_init(&work_queue);
+  for (int i = 0; i < num_threads; i++) {
+    pthread_t id;
+    if (pthread_create(&id, NULL, handle_clients, (void*)request_handler) !=
+        0) {
+      perror("Failed to create a worker thread");
+      exit(-1);
+    }
+    puts("Created worker thread");
+  }
 }
 #endif
 
@@ -664,23 +674,19 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
 
     pthread_t thread;
     pthread_create(&thread, NULL, (void*)request_handler,
-                   (void*)client_socket_number);
+                   (void*)((long)client_socket_number));
 
     // We won't join on it
     pthread_detach(thread);
 
 #elif POOLSERVER
     /*
-     * TODO: PART 7
-     *
      * When a client connection has been accepted, add the
      * client's socket number to the work queue. A thread
      * in the thread pool will send a response to the client.
      */
+    wq_push(&work_queue, client_socket_number);
 
-    /* PART 7 BEGIN */
-
-    /* PART 7 END */
 #endif
   }
 
