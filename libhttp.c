@@ -80,6 +80,7 @@ int relay_large_msg(char* buffer, size_t max_size, int from, int to,
   for (total = 0; total < msg_size;) {
     red = readn(from, buffer, read_size);
     if (red <= 0) {
+      puts("Error relay_large_msg readn");
       return -1;
     }
     buffer[red] = '\0';
@@ -109,14 +110,14 @@ ssize_t get_header_len(int fd, char* target) {
 
   for (size_t total = 0; total < LIBHTTP_REQUEST_MAX_SIZE;) {
     // Get header length. Don't forget the MSG_PEEK flag.
-    if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE, MSG_PEEK)) <= 0) {
+    if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE - total, MSG_PEEK)) <=
+        0) {
       if (red == 0) return 0;
       perror("Error get_header_len recv");
       return -1;
     }
     total += red;
     buffer[total] = '\0';
-
     // Found delimiter. Send the header.
     if ((found = strstr(buffer, target)) != NULL) {
       found += strlen(target);
@@ -135,8 +136,8 @@ ssize_t http_get_next_chunk(int socket_fd) {
   ssize_t chunk_size;
   char* end_ptr = NULL;
   ssize_t red = 0;
-  for (size_t i = 1;; i++) {
-    if ((red = recv(socket_fd, recv_str, i, MSG_PEEK)) == -1) {
+  for (size_t i = 1; i < 255; i++) {
+    if ((red = recv(socket_fd, recv_str, i, MSG_PEEK)) <= 0) {
       perror("Error get_next_chunk");
       return -1;
     }
