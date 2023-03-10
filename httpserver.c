@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <asm-generic/errno.h>
 #include <asm-generic/socket.h>
 #include <dirent.h>
 #include <errno.h>
@@ -23,6 +24,15 @@
 #include "wq.h"
 
 #define BUFFER 2048
+
+#define RED "\x1B[31m"
+#define GRN "\x1B[32m"
+#define YEL "\x1B[33m"
+#define BLU "\x1B[34m"
+#define MAG "\x1B[35m"
+#define CYN "\x1B[36m"
+#define WHT "\x1B[37m"
+#define RESET "\x1B[0m"
 
 /*
  * Global configuration variables.
@@ -58,7 +68,7 @@ char* parse_host_name(int fd) {
     if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE - total, MSG_PEEK)) <=
         0) {
       if (red == 0) return 0;
-      perror("Error parse_host_name recv");
+      // perror("Error parse_host_name recv");
       return NULL;
     }
     total += red;
@@ -165,7 +175,11 @@ void* proxy_client(void* args_) {
     // puts("Target waiting get_header_len");
     header_len = get_header_len(client_fd, "\r\n\r\n");
     if (header_len <= 0) {
-      if (header_len < 0) perror("Error get_header_len");
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        puts(YEL "Client socket timed-out!" RESET);
+      } else if (header_len < 0) {
+        perror("Error get_header_len");
+      }
       break;
     }
     // puts("Red target header");
@@ -211,22 +225,12 @@ void* proxy_client(void* args_) {
       }
       chunk_size = http_get_next_chunk(client_fd);
     }
-    // pthread_mutex_lock(&mutex);
-    // while (!is_done_target) pthread_cond_wait(&cond, &mutex);
-    // is_done_target = false;
-    // pthread_mutex_unlock(&mutex);
   } while (1);
   pthread_mutex_lock(args->mutex);
   *is_done_client = true;
   pthread_cond_signal(args->cond);
   pthread_mutex_unlock(args->mutex);
-  // shutdown(client_fd, SHUT_RD);
-  // shutdown(target_fd, SHUT_WR);
-  // if (close(target_fd) < 0) {
-  // puts("Error closing target_fd");
-  // }
-  // close(client_fd);
-  puts("Client Finished!");
+  // puts("Client Finished!");
   pthread_exit(NULL);
 }
 
@@ -243,10 +247,13 @@ void* proxy_target(void* args_) {
 
   do {
     // Read the HTTP header
-    // puts("Target waiting get_header_len");
     header_len = get_header_len(target_fd, "\r\n\r\n");
     if (header_len <= 0) {
-      if (header_len < 0) perror("Error get_header_len");
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        puts(YEL "Target socket timed-out!" RESET);
+      } else if (header_len < 0) {
+        perror("Error get_header_len");
+      }
       break;
     }
     // puts("Red target header");
@@ -255,7 +262,7 @@ void* proxy_target(void* args_) {
       break;
     }
     buffer[red] = '\0';
-    printf("%s", buffer);
+    printf(GRN "%s" RESET, buffer);
     ssize_t wrote;
     if ((wrote = writen(client_fd, buffer, header_len)) < header_len) {
       perror("Error getting header writen");
@@ -278,7 +285,6 @@ void* proxy_target(void* args_) {
     }
 
     while (body == BODY_CHUNKED) {
-      // puts("inner looop thread");
       chunk_size = http_get_next_chunk(target_fd);
       if (relay_large_msg(buffer, LIBHTTP_REQUEST_MAX_SIZE, target_fd,
                           client_fd, chunk_size) <= 0) {
@@ -290,23 +296,13 @@ void* proxy_target(void* args_) {
         break;
       }
     }
-    // pthread_mutex_lock(&mutex);
-    // while (!is_done_target) pthread_cond_wait(&cond, &mutex);
-    // is_done_target = false;
-    // pthread_mutex_unlock(&mutex);
   } while (1);
 
   pthread_mutex_lock(args->mutex);
   *is_done_target = true;
   pthread_cond_signal(args->cond);
   pthread_mutex_unlock(args->mutex);
-  // shutdown(client_fd, SHUT_WR);
-  // shutdown(target_fd, SHUT_RD);
-  // if (close(client_fd) < 0) {
-  // perror("Erro closing client_fd");
-  // }
-  // close(target_fd);
-  puts("Target Finished!");
+  // puts("Target Finished!");
   pthread_exit(NULL);
 }
 
@@ -485,8 +481,8 @@ void handle_proxy_request(int client_fd) {
   char* server_proxy_hostname = NULL;
 
   if ((server_proxy_hostname = parse_host_name(client_fd)) == NULL) {
-    puts("Couldn't parse hostname");
-    http_reject_response(client_fd, 400);
+    // puts("Couldn't parse hostname");
+    // http_reject_response(client_fd, 400);
     goto done;
   }
 
@@ -554,7 +550,7 @@ void handle_proxy_request(int client_fd) {
     perror("Error Joining client_thread");
   }
 
-  printf("CLOOOOOOOOOOOOOOSING connection %d\n", client_fd);
+  printf(CYN "CLOSING SOCKET #%d\n" RESET, client_fd);
 
 done:
   close(client_fd);
@@ -668,7 +664,7 @@ void serve_forever(int* socket_number, void (*request_handler)(int)) {
       continue;
     }
 
-    printf("Accepted connection from %s on port %d. SOCKEEEEEEEEET = %d\n",
+    printf(MAG "Accepted connection from %s on port %d. Socket #%d\n" RESET,
            inet_ntoa(client_address.sin_addr), client_address.sin_port,
            client_socket_number);
 

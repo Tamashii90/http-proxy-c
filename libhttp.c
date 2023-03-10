@@ -90,7 +90,6 @@ int relay_large_msg(char* buffer, size_t max_size, int from, int to,
       printf("read %zu, wrote %zu\n", red, wrote);
       return -1;
     }
-    // printf("read %zu, wrote %zu\n", red, wrote);
 
     if (msg_size - total < max_size) {
       read_size = msg_size - total;
@@ -113,7 +112,7 @@ ssize_t get_header_len(int fd, char* target) {
     if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE - total, MSG_PEEK)) <=
         0) {
       if (red == 0) return 0;
-      perror("Error get_header_len recv");
+      // perror("Error get_header_len recv");
       return -1;
     }
     total += red;
