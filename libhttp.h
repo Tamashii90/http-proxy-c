@@ -60,5 +60,7 @@ ssize_t readn(int fd, void* buffer, size_t n);
 /* Util functions */
 void str_to_lower(char* str, size_t len);
 enum body_enum has_body(char* http_header, size_t len);
+char* parse_host_name(int sock_fd);
+int connect_target(int client_fd, char* server_hostname);
 
 #endif

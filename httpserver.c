@@ -56,105 +56,6 @@ typedef struct {
   char* server_proxy_hostname;
 } ARGS;
 
-char* parse_host_name(int fd) {
-  char buffer[LIBHTTP_REQUEST_MAX_SIZE + 1];
-  ssize_t red;
-  char* begin;
-  char* end;
-  char* host;
-
-  for (size_t total = 0; total < LIBHTTP_REQUEST_MAX_SIZE;) {
-    // Don't forget the MSG_PEEK flag.
-    if ((red = recv(fd, buffer, LIBHTTP_REQUEST_MAX_SIZE - total, MSG_PEEK)) <=
-        0) {
-      if (red == 0) return 0;
-      // perror("Error parse_host_name recv");
-      return NULL;
-    }
-    total += red;
-    buffer[total] = '\0';
-
-    // Change to lowercase because some servers don't capitalize the H in Host
-    str_to_lower(buffer, red);
-
-    if ((begin = strstr(buffer, "host: ")) != NULL) {
-      /*
-       * Host field has the format "Host: mywebsite.com:80\r\n"
-       * Port number is optional
-       */
-      begin += strlen("host: ");
-      if ((end = strchr(begin, '\r')) != NULL) {
-        void* colon = NULL;
-        // Must use strchr or it will search all of the header
-        if ((colon = memchr(begin, ':', end - begin)) != NULL) {
-          end = colon;
-        }
-        host = malloc(end - begin + 1);
-        strncpy(host, begin, end - begin);
-        host[end - begin] = '\0';
-        return host;
-      }
-    }
-  }
-  return NULL;
-}
-
-int connect_target(int client_fd, char* server_proxy_hostname) {
-  /*
-   * The code below does a DNS lookup of server_proxy_hostname and
-   * opens a connection to it. Please do not modify.
-   */
-  int target_fd;
-  int server_proxy_port = 80;
-  struct sockaddr_in target_address;
-
-  if (server_proxy_hostname == NULL) {
-    puts("Hostname is null..");
-    return -1;
-  }
-
-  memset(&target_address, 0, sizeof(target_address));
-  target_address.sin_family = AF_INET;
-  target_address.sin_port = htons(server_proxy_port);
-
-  // Use DNS to resolve the proxy target's IP address
-  struct hostent* target_dns_entry =
-      gethostbyname2(server_proxy_hostname, AF_INET);
-
-  // Create an IPv4 TCP socket to communicate with the proxy target.
-  target_fd = socket(PF_INET, SOCK_STREAM, 0);
-  if (target_fd == -1) {
-    fprintf(stderr, "Failed to create a new socket: error %d: %s\n", errno,
-            strerror(errno));
-    close(client_fd);
-    exit(errno);
-  }
-
-  if (target_dns_entry == NULL) {
-    fprintf(stderr, "Cannot find host: %s\n", server_proxy_hostname);
-    close(target_fd);
-    close(client_fd);
-    exit(ENXIO);
-  }
-
-  char* dns_address = target_dns_entry->h_addr_list[0];
-
-  // Connect to the proxy target.
-  memcpy(&target_address.sin_addr, dns_address,
-         sizeof(target_address.sin_addr));
-  int connection_status = connect(target_fd, (struct sockaddr*)&target_address,
-                                  sizeof(target_address));
-
-  if (connection_status < 0) {
-    /* Dummy request parsing, just to be compliant. */
-    struct http_request* req = http_request_parse(client_fd);
-    free(req);
-    return -1;
-  }
-
-  return target_fd;
-}
-
 void* proxy_client(void* args_) {
   ARGS* args = (ARGS*)args_;
   int client_fd = args->client_fd;
@@ -188,7 +89,7 @@ void* proxy_client(void* args_) {
       break;
     }
     buffer[red] = '\0';
-    printf("%s", buffer);
+    printf(BLU "%s" RESET, buffer);
     ssize_t wrote;
     if ((wrote = writen(target_fd, buffer, header_len)) < header_len) {
       perror("Error getting header writen");
@@ -550,7 +451,7 @@ void handle_proxy_request(int client_fd) {
     perror("Error Joining client_thread");
   }
 
-  printf(CYN "CLOSING SOCKET #%d\n" RESET, client_fd);
+  printf(RED "Closing Socket" YEL " #%d\n" RESET, client_fd);
 
 done:
   close(client_fd);
